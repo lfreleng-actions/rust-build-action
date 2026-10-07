@@ -20,13 +20,13 @@ concurrency:
 permissions: {}
 
 jobs:
-  ### Test the GitHub Action in this Repository ###
-  tests:
-    name: "Test local GitHub Action"
+  ### Unit tests: the scripts against stand-in tools ###
+  unit-tests:
+    name: "Unit tests (bats)"
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    timeout-minutes: 10 # Increase this timeout value as needed
+    timeout-minutes: 15
     steps:
       # Load the egress allow-list out-of-band from the
       # organisation's .github repository and publish it as
@@ -34,14 +34,13 @@ jobs:
       # yamllint disable-line rule:line-length
       - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
         with:
-          config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
+          config: '@538904e241556d101fb908b50e2a2965fa0346cf'  # v0.16.6
 
-      # Harden the runner with the just-loaded allow-list.
-      - name: 'Harden runner (block)'
+      - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        uses: step-security/harden-runner@351661ca32ac09a36dc5ee2d536e3128f2a3c8ed  # v2.22.0
         with:
-          egress-policy: 'block'
+          egress-policy: "block"
           allowed-endpoints: >
             ${{ env.CONNECTION_ALLOW_LIST }}
 
@@ -50,41 +49,528 @@ jobs:
         with:
           persist-credentials: false
 
-      # Perform setup prior to running test(s)
-      - name: "Testing setup step"
-        shell: bash
-        run: |
-          # Testing setup step
-          echo "Testing setup step"
-          echo "Testing setup step/summary output" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: "Running local action: ${{ github.repository }}"
-        uses: $/
-        with:
-          input: "test input 💬"
-
-      - name: "Validated local action: ${{ github.repository }}"
+      - name: "Install bats"
         shell: bash
         env:
-          REPO: ${{ github.repository }}
+          # bats-core v1.13.0
+          BATS_COMMIT: "3bca150ec86275d6d9d5a4fd7d48ab8b6c6f3d87"
         run: |
-          # Local action validation
-          echo "Validated local action: $REPO"
-          echo "Validation step summary output" >> "$GITHUB_STEP_SUMMARY"
+          # Install bats
+          dir="$RUNNER_TEMP/bats-core"
+          git init -q "$dir"
+          git -C "$dir" fetch -q --depth 1 \
+            https://github.com/bats-core/bats-core.git "$BATS_COMMIT"
+          git -C "$dir" checkout -q FETCH_HEAD
+          "$dir/bin/bats" --version
 
-      # yamllint disable-line rule:line-length
-      - name: "Running local action: ${{ github.repository }} [Override Failure]"
-        uses: $/
-        id: failure
-        continue-on-error: true
-        with:
-          invalid_input: "Some garbage"
-
-      # Failure testing is also important
-      - name: "Error if step above did NOT fail"
-        if: steps.failure.outcome == 'success'
+      - name: "Run bats"
         shell: bash
         run: |
-          # Error if step above did NOT fail
-          echo "Error: previous test step did NOT fail ❌"
-          exit 1
+          # Run bats
+          "$RUNNER_TEMP/bats-core/bin/bats" tests/
+
+      - name: "Run shellcheck"
+        shell: bash
+        run: |
+          # Run shellcheck
+          shellcheck --version | sed -n 2p
+          shellcheck scripts/*.sh tests/fixtures/*.sh
+          shellcheck -s bash tests/rust-build.bats
+
+  ### Published fixture: binaries, crates and an uploaded artefact ###
+  test-rust-project:
+    name: "Build test-rust-project"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    outputs:
+      artefact_name: ${{ steps.build.outputs.artefact_name }}
+      binary_sha256: ${{ steps.check.outputs.binary_sha256 }}
+      crate_sha256: ${{ steps.check.outputs.crate_sha256 }}
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+        with:
+          config: '@538904e241556d101fb908b50e2a2965fa0346cf'  # v0.16.6
+
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@351661ca32ac09a36dc5ee2d536e3128f2a3c8ed  # v2.22.0
+        with:
+          egress-policy: "block"
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Checkout test-rust-project"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: lfreleng-actions/test-rust-project
+          ref: "5db6f8f6624e676d1d76f8db02a0253fee39900c"  # v0.0.1
+          path: fixture
+          persist-credentials: false
+
+      - name: "Running local action: ${{ github.repository }}"
+        id: build
+        uses: $/
+        with:
+          path_prefix: fixture
+          binaries: "true"
+          package_crates: "true"
+          lockfile_required: "true"
+          artefact_name: "rust-build-fixture-${{ github.run_attempt }}"
+          # Hidden, to check that the upload keeps it.
+          artefact_path: .dist
+
+      - name: "Check outputs and artefact directory"
+        id: check
+        shell: bash
+        env:
+          TOOLCHAIN: ${{ steps.build.outputs.toolchain }}
+          TOOLCHAIN_KIND: ${{ steps.build.outputs.toolchain_kind }}
+          CARGO_VERSION: ${{ steps.build.outputs.cargo_version }}
+          RUSTC_VERSION: ${{ steps.build.outputs.rustc_version }}
+          TARGET: ${{ steps.build.outputs.target }}
+          PROFILE: ${{ steps.build.outputs.profile }}
+          ARTEFACT_PATH: ${{ steps.build.outputs.artefact_path }}
+          BINARIES_JSON: ${{ steps.build.outputs.binaries_json }}
+          CRATES_JSON: ${{ steps.build.outputs.crates_json }}
+          RUST_VERSION: ${{ steps.build.outputs.rust_version }}
+        run: |
+          # Check outputs and artefact directory
+          set -euo pipefail
+          echo "toolchain=$TOOLCHAIN ($TOOLCHAIN_KIND)"
+          echo "cargo=$CARGO_VERSION rustc=$RUSTC_VERSION target=$TARGET"
+          [ "$TOOLCHAIN_KIND" = channel ]
+          [ -n "$TOOLCHAIN" ] && [ -n "$CARGO_VERSION" ]
+          [ -n "$RUSTC_VERSION" ]
+          [ "$TARGET" = "$(rustc -vV | sed -n 's/^host: //p')" ]
+          [ "$PROFILE" = release ]
+          [ -z "$RUST_VERSION" ]
+          [ "$ARTEFACT_PATH" = fixture/.dist ]
+
+          name=lfreleng-test-rust-project
+          jq -e --arg n "$name" \
+            'length == 1 and .[0].name == $n and .[0].path == $n' \
+            <<< "$BINARIES_JSON"
+          jq -e --arg n "$name" '
+            length == 1 and .[0].name == $n and .[0].version == "0.1.0"
+            and .[0].file == "crates/\($n)-0.1.0.crate"' <<< "$CRATES_JSON"
+
+          cd "$ARTEFACT_PATH"
+          sha256sum -c SHA256SUMS
+          [ "$(./"$name" CI)" = "Hello, CI!" ]
+          jq -e --argjson want "$CRATES_JSON" '. == $want' crates.json
+          jq -r '.[] | "\(.sha256)  \(.file)"' crates.json | sha256sum -c
+          find . -type f | sort
+          {
+            echo "binary_sha256=$(jq -r '.[0].sha256' <<< "$BINARIES_JSON")"
+            echo "crate_sha256=$(jq -r '.[0].sha256' <<< "$CRATES_JSON")"
+          } >> "$GITHUB_OUTPUT"
+
+  ### The uploaded artefact, from a job that did not build it ###
+  verify-artefact:
+    name: "Verify uploaded artefact"
+    needs: test-rust-project
+    runs-on: ubuntu-latest
+    permissions: {}
+    timeout-minutes: 10
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+        with:
+          config: '@538904e241556d101fb908b50e2a2965fa0346cf'  # v0.16.6
+
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@351661ca32ac09a36dc5ee2d536e3128f2a3c8ed  # v2.22.0
+        with:
+          egress-policy: "block"
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Download artefact"
+        # yamllint disable-line rule:line-length
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ needs.test-rust-project.outputs.artefact_name }}
+          path: downloaded
+
+      - name: "Check artefact contents"
+        shell: bash
+        working-directory: downloaded
+        env:
+          BINARY_SHA256: ${{ needs.test-rust-project.outputs.binary_sha256 }}
+          CRATE_SHA256: ${{ needs.test-rust-project.outputs.crate_sha256 }}
+        run: |
+          # Check artefact contents
+          set -euo pipefail
+          name=lfreleng-test-rust-project
+          crate="crates/$name-0.1.0.crate"
+          listing="$(find . -type f | sort)"
+          echo "$listing"
+          expected="$(printf '%s\n' "./$crate" ./SHA256SUMS ./crates.json \
+            "./$name" | sort)"
+          [ "$listing" = "$expected" ]
+          sha256sum -c SHA256SUMS
+          echo "$BINARY_SHA256  $name" | sha256sum -c
+          echo "$CRATE_SHA256  $crate" | sha256sum -c
+          jq -r '.[] | "\(.sha256)  \(.file)"' crates.json | sha256sum -c
+          crate_files="$(tar -tzf "$crate")"
+          grep -qx "$name-0.1.0/Cargo.toml" <<< "$crate_files"
+
+  ### Generated workspace: selection, setup script, lockfile, scrubbing ###
+  workspace-fixture:
+    name: "Build generated workspace"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+        with:
+          config: '@538904e241556d101fb908b50e2a2965fa0346cf'  # v0.16.6
+
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@351661ca32ac09a36dc5ee2d536e3128f2a3c8ed  # v2.22.0
+        with:
+          egress-policy: "block"
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Members: 'a' (library), 'b' (library and binary, depending on
+      # 'a' by path and version) and 'c' (binary, publish = false),
+      # committed without Cargo.lock in their own git repository.
+      - name: "Generate workspace fixture"
+        id: fixture
+        shell: bash
+        run: |
+          # Generate workspace fixture
+          set -euo pipefail
+          random="$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n')"
+          base="lfreleng-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$random"
+          root=fixtures/workspace
+          mkdir -p "$root/a/src" "$root/b/src" "$root/c/src"
+          cd "$root"
+          printf '[workspace]\nresolver = "2"\nmembers = ["a", "b", "c"]\n' \
+            > Cargo.toml
+          printf '/target\n' > .gitignore
+          for member in a b c; do
+            printf '%s\n' '[package]' "name = \"$base-$member\"" \
+              'version = "0.1.0"' 'edition = "2021"' \
+              'description = "lfreleng-actions CI fixture"' \
+              'license = "Apache-2.0"' > "$member/Cargo.toml"
+          done
+          printf 'pub fn value() -> u32 {\n    42\n}\n' > a/src/lib.rs
+          dependency="package = \"$base-a\", path = \"../a\""
+          dependency="{ $dependency, version = \"0.1.0\" }"
+          printf '%s\n' '' '[dependencies]' "alpha = $dependency" \
+            >> b/Cargo.toml
+          printf 'pub fn value() -> u32 {\n    alpha::value() + 1\n}\n' \
+            > b/src/lib.rs
+          lib="${base//-/_}_b"
+          printf 'fn main() {\n    println!("b={}", %s::value());\n}\n' \
+            "$lib" > b/src/main.rs
+          printf '\npublish = false\n' >> c/Cargo.toml
+          printf 'fn main() {\n    println!("c");\n}\n' > c/src/main.rs
+          # The action runs this without credentials or the runner's
+          # command files, but keeps other registry settings.
+          cat > ci-setup.sh << 'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          for name in CARGO_REGISTRY_TOKEN CARGO_REGISTRIES_CRATES_IO_TOKEN \
+            CARGO_REGISTRIES_PRIVATE_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN \
+            ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_RUNTIME_TOKEN GITHUB_OUTPUT \
+            GITHUB_ENV GITHUB_PATH GITHUB_STATE GITHUB_STEP_SUMMARY; do
+            if [ -n "${!name+set}" ]; then
+              echo "setup script can read $name" >&2
+              exit 1
+            fi
+          done
+          if [ -z "${CARGO_REGISTRIES_PRIVATE_INDEX:-}" ]; then
+            echo "setup script lost CARGO_REGISTRIES_PRIVATE_INDEX" >&2
+            exit 1
+          fi
+          echo "${RUSTUP_TOOLCHAIN-unset}" > "$RUNNER_TEMP/setup-toolchain"
+          EOF
+          git init -q -b main
+          git add -A
+          git -c user.name=CI -c user.email=ci@example.invalid \
+            -c commit.gpgsign=false commit -q -m "Fixture"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+
+      - name: "Running local action: ${{ github.repository }}"
+        id: build
+        uses: $/
+        env:
+          # Placeholders: the action must keep these from Cargo and the
+          # setup script, and pass the registry index through.
+          CARGO_REGISTRY_TOKEN: "placeholder-not-a-token"
+          CARGO_REGISTRIES_CRATES_IO_TOKEN: "placeholder-not-a-token"
+          CARGO_REGISTRIES_PRIVATE_TOKEN: "placeholder-not-a-token"
+          CARGO_REGISTRIES_PRIVATE_INDEX: "sparse+https://example.invalid/"
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: "placeholder-not-a-token"
+        with:
+          path_prefix: fixtures/workspace
+          toolchain: stable
+          setup_script: ci-setup.sh
+          profile: dev
+          binaries: "true"
+          package_crates: "true"
+          artefact_upload: "false"
+          artefact_path: out/dist
+
+      - name: "Check outputs and artefact directory"
+        shell: bash
+        env:
+          BASE: ${{ steps.fixture.outputs.base }}
+          TOOLCHAIN: ${{ steps.build.outputs.toolchain }}
+          TOOLCHAIN_KIND: ${{ steps.build.outputs.toolchain_kind }}
+          PROFILE: ${{ steps.build.outputs.profile }}
+          ARTEFACT_PATH: ${{ steps.build.outputs.artefact_path }}
+          BINARIES_JSON: ${{ steps.build.outputs.binaries_json }}
+          CRATES_JSON: ${{ steps.build.outputs.crates_json }}
+        run: |
+          # Check outputs and artefact directory
+          set -euo pipefail
+          [ "$TOOLCHAIN" = stable ] && [ "$TOOLCHAIN_KIND" = channel ]
+          [ "$(cat "$RUNNER_TEMP/setup-toolchain")" = stable ]
+          [ "$PROFILE" = dev ]
+          [ "$ARTEFACT_PATH" = fixtures/workspace/out/dist ]
+          [ -f fixtures/workspace/Cargo.lock ]
+          jq -e --arg b "$BASE" \
+            '[.[].name] | sort == ["\($b)-b", "\($b)-c"]' <<< "$BINARIES_JSON"
+          jq -e --arg b "$BASE" '
+            [.[] | [.name, .version, .file]] | sort == [
+              ["\($b)-a", "0.1.0", "crates/\($b)-a-0.1.0.crate"],
+              ["\($b)-b", "0.1.0", "crates/\($b)-b-0.1.0.crate"]]' \
+            <<< "$CRATES_JSON"
+          cd "$ARTEFACT_PATH"
+          sha256sum -c SHA256SUMS
+          jq -r '.[] | "\(.sha256)  \(.file)"' crates.json | sha256sum -c
+          [ "$(./"$BASE-b")" = "b=43" ]
+          [ "$(./"$BASE-c")" = "c" ]
+          find . -type f | sort
+
+      # packages replaces --workspace (the default): Cargo must build
+      # the named member alone, here in an unused release profile.
+      - name: "Running local action: packages"
+        id: packages
+        uses: $/
+        with:
+          path_prefix: fixtures/workspace
+          toolchain: stable
+          packages: ${{ steps.fixture.outputs.base }}-c
+          binaries: "true"
+          artefact_upload: "false"
+          artefact_path: out/packages
+
+      - name: "Check that only the named package was built"
+        shell: bash
+        env:
+          BASE: ${{ steps.fixture.outputs.base }}
+          BINARIES_JSON: ${{ steps.packages.outputs.binaries_json }}
+          TARGET: ${{ steps.packages.outputs.target }}
+        run: |
+          # Check that only the named package was built
+          set -euo pipefail
+          jq -e --arg b "$BASE" '[.[].name] == ["\($b)-c"]' <<< "$BINARIES_JSON"
+          release="fixtures/workspace/target/$TARGET/release"
+          [ -x "$release/$BASE-c" ]
+          [ ! -e "$release/$BASE-b" ]
+          built="$(find "$release" -name "lib${BASE//-/_}_[ab]*")"
+          if [ -n "$built" ]; then
+            echo "::error::packages built members it does not name"
+            exit 1
+          fi
+
+  ### Failure paths: each step must fail ###
+  failure-paths:
+    name: "Failure paths"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+        with:
+          config: '@538904e241556d101fb908b50e2a2965fa0346cf'  # v0.16.6
+
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@351661ca32ac09a36dc5ee2d536e3128f2a3c8ed  # v2.22.0
+        with:
+          egress-policy: "block"
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Checkout test-rust-project"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: lfreleng-actions/test-rust-project
+          ref: "5db6f8f6624e676d1d76f8db02a0253fee39900c"  # v0.0.1
+          path: fixture
+          persist-credentials: false
+
+      # 'broken' fails to compile; 'nolock' builds but has no Cargo.lock.
+      - name: "Generate failing fixtures"
+        shell: bash
+        run: |
+          # Generate failing fixtures
+          set -euo pipefail
+          random="$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n')"
+          base="lfreleng-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$random"
+          for name in broken nolock; do
+            mkdir -p "fixtures/$name/src"
+            printf '%s\n' '[package]' "name = \"$base-$name\"" \
+              'version = "0.1.0"' 'edition = "2021"' \
+              > "fixtures/$name/Cargo.toml"
+          done
+          printf 'fn main() {\n    let x: u32 = "text";\n}\n' \
+            > fixtures/broken/src/main.rs
+          printf 'fn main() {}\n' > fixtures/nolock/src/main.rs
+
+      - name: "Invalid boolean [expected failure]"
+        id: bad_boolean
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: fixture
+          binaries: "yes"
+          artefact_upload: "false"
+
+      - name: "exclude with packages [expected failure]"
+        id: exclude_packages
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: fixture
+          packages: fixture
+          exclude: other
+          artefact_upload: "false"
+
+      - name: "Glob in artefact_path [expected failure]"
+        id: glob_artefact_path
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: fixture
+          binaries: "true"
+          artefact_path: "*"
+
+      - name: "Missing manifest [expected failure]"
+        id: missing_manifest
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: fixture
+          manifest_path: missing/Cargo.toml
+          artefact_upload: "false"
+
+      - name: "path_prefix outside the workspace [expected failure]"
+        id: outside_workspace
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: ".."
+          artefact_upload: "false"
+
+      - name: "cargo_args sets --release [expected failure]"
+        id: reserved_args
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: fixture
+          cargo_args: "-vr"
+          artefact_upload: "false"
+
+      - name: "Unknown target [expected failure]"
+        id: bad_target
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: fixture
+          target: x86_64-unknown-nonexistent-os
+          artefact_upload: "false"
+
+      - name: "Missing required lockfile [expected failure]"
+        id: no_lockfile
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: fixtures/nolock
+          lockfile_required: "true"
+          artefact_upload: "false"
+
+      - name: "Compile error [expected failure]"
+        id: compile_error
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: fixtures/broken
+          binaries: "true"
+          artefact_upload: "false"
+
+      - name: "Verify failure outcomes"
+        shell: bash
+        env:
+          BAD_BOOLEAN: ${{ steps.bad_boolean.outcome }}
+          BAD_BOOLEAN_TOOLCHAIN: ${{ steps.bad_boolean.outputs.toolchain_kind }}
+          EXCLUDE_PACKAGES: ${{ steps.exclude_packages.outcome }}
+          # yamllint disable-line rule:line-length
+          EXCLUDE_PACKAGES_TOOLCHAIN: ${{ steps.exclude_packages.outputs.toolchain_kind }}
+          GLOB_ARTEFACT_PATH: ${{ steps.glob_artefact_path.outcome }}
+          # yamllint disable-line rule:line-length
+          GLOB_ARTEFACT_PATH_OUTPUT: ${{ steps.glob_artefact_path.outputs.artefact_path }}
+          MISSING_MANIFEST: ${{ steps.missing_manifest.outcome }}
+          OUTSIDE_WORKSPACE: ${{ steps.outside_workspace.outcome }}
+          RESERVED_ARGS: ${{ steps.reserved_args.outcome }}
+          BAD_TARGET: ${{ steps.bad_target.outcome }}
+          BAD_TARGET_TARGET: ${{ steps.bad_target.outputs.target }}
+          NO_LOCKFILE: ${{ steps.no_lockfile.outcome }}
+          COMPILE_ERROR: ${{ steps.compile_error.outcome }}
+          COMPILE_ERROR_CARGO: ${{ steps.compile_error.outputs.cargo_version }}
+          # yamllint disable-line rule:line-length
+          COMPILE_ERROR_BINARIES: ${{ steps.compile_error.outputs.binaries_json }}
+        run: |
+          # Verify failure outcomes
+          set -euo pipefail
+          status=0
+          for name in BAD_BOOLEAN EXCLUDE_PACKAGES GLOB_ARTEFACT_PATH \
+            MISSING_MANIFEST OUTSIDE_WORKSPACE RESERVED_ARGS BAD_TARGET \
+            NO_LOCKFILE COMPILE_ERROR; do
+            if [ "${!name}" = failure ]; then
+              echo "✅ $name failed as expected"
+            else
+              echo "::error::$name outcome was '${!name}', expected failure"
+              status=1
+            fi
+          done
+          # Input checks fail before the toolchain stage; the target and
+          # build failures happen after it, and leave no binaries.
+          [ -z "$BAD_BOOLEAN_TOOLCHAIN" ] || status=1
+          [ -z "$EXCLUDE_PACKAGES_TOOLCHAIN" ] || status=1
+          [ -z "$GLOB_ARTEFACT_PATH_OUTPUT" ] || status=1
+          [ "$BAD_TARGET_TARGET" = x86_64-unknown-nonexistent-os ] || status=1
+          [ -n "$COMPILE_ERROR_CARGO" ] || status=1
+          [ -z "$COMPILE_ERROR_BINARIES" ] || status=1
+          [ ! -e fixtures/nolock/Cargo.lock ] || status=1
+          exit "$status"
