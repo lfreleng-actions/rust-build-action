@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# rust-build.sh sources summary.sh. Resolve 'source' directives against
+# the sourcing script's directory, and read the sourced file even when
+# only one script is passed to ShellCheck, as pre-commit hooks do.
+external-sources=true
+source-path=SCRIPTDIR

@@ -1,53 +1,190 @@
 ---
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2025 The Linux Foundation
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
 
-# actions-template
-name: "🛠️ Actions Template"
-description: "Description of action"
-# Any relevant notes/observations can go here
+# rust-build-action
+name: "🦀 Rust Build"
+# yamllint disable-line rule:line-length
+description: "Builds a Rust project with Cargo, optionally collecting its binaries and packaging its crates"
+# Stages: validate inputs, resolve the toolchain once, run an optional
+# setup script, add the target, read metadata, check the lockfile,
+# 'cargo build', 'cargo package', then gather binaries and crates
+# with checksums into artefact_path and upload them. Holds no
+# credentials and needs no 'id-token' permission; attest and sign the
+# uploaded artefact in a separate job.
 
 inputs:
-  input:
-    description: "Description of input"
-    required: true
+  # Optional
+  path_prefix:
+    description: "Directory holding the project, inside the workspace"
+    required: false
+    default: "."
+  manifest_path:
+    # yamllint disable-line rule:line-length
+    description: "Path to Cargo.toml, relative to path_prefix or absolute (inside the workspace)"
+    required: false
+    default: "Cargo.toml"
+  workspace:
+    description: "Build every member ('true'/'false'); packages replaces it"
+    required: false
+    default: "true"
+  packages:
+    description: "Whitespace-separated packages (-p); replaces --workspace"
+    required: false
+    default: ""
+  exclude:
+    description: "Packages to skip (--exclude); needs workspace, no packages"
+    required: false
+    default: ""
+  features:
+    description: "Features to enable, separated by whitespace or commas"
+    required: false
+    default: ""
+  all_features:
+    description: "Enable all features ('true'/'false')"
+    required: false
+    default: "false"
+  no_default_features:
+    description: "Disable default features ('true'/'false')"
+    required: false
+    default: "false"
+  toolchain:
+    # yamllint disable-line rule:line-length
+    description: "rustup channel to use; empty uses the one path_prefix selects"
+    required: false
+    default: ""
+  lockfile_required:
+    # yamllint disable-line rule:line-length
+    description: "Fail when Cargo.lock is missing, instead of generating it ('true'/'false')"
+    required: false
+    default: "false"
+  setup_script:
+    # yamllint disable-line rule:line-length
+    description: "Script to run with bash before Cargo, relative to path_prefix"
+    required: false
+    default: ""
+  target:
+    description: "Target triple to build for; empty builds for the host"
+    required: false
+    default: ""
+  profile:
+    description: "Cargo profile: dev, release or a custom profile name"
+    required: false
+    default: "release"
+  cargo_args:
+    # yamllint disable-line rule:line-length
+    description: "Extra 'cargo build' arguments, split on whitespace, never run by a shell"
+    required: false
+    default: ""
+  binaries:
+    # yamllint disable-line rule:line-length
+    description: "Copy built binaries into artefact_path with SHA256SUMS ('true'/'false')"
+    required: false
+    default: "false"
+  package_crates:
+    # yamllint disable-line rule:line-length
+    description: "Package publishable crates into artefact_path/crates with crates.json ('true'/'false')"
+    required: false
+    default: "false"
+  artefact_upload:
+    # yamllint disable-line rule:line-length
+    description: "Upload artefact_path as a workflow artefact when it holds files ('true'/'false')"
+    required: false
+    default: "true"
+  artefact_name:
+    description: "Artefact name; empty uses rust-build-<target triple>"
+    required: false
+    default: ""
+  artefact_path:
+    # yamllint disable-line rule:line-length
+    description: "Directory for binaries and crates, relative to path_prefix; must be empty"
+    required: false
+    default: "dist"
+  summary:
+    description: "Write a job summary ('true'/'false')"
+    required: false
+    default: "true"
 
 outputs:
-  output:
-    description: "Description of output"
-    value: ${{ steps.code.outputs.output }}
+  toolchain:
+    description: "Toolchain used: rustup channel or path; empty without rustup"
+    value: ${{ steps.build.outputs.toolchain }}
+  toolchain_kind:
+    description: "How the toolchain was chosen: 'channel', 'path' or 'none'"
+    value: ${{ steps.build.outputs.toolchain_kind }}
+  cargo_version:
+    description: "Cargo version that ran the build"
+    value: ${{ steps.build.outputs.cargo_version }}
+  rustc_version:
+    description: "rustc version that ran the build"
+    value: ${{ steps.build.outputs.rustc_version }}
+  target:
+    description: "Target triple built for; the host triple when target is empty"
+    value: ${{ steps.build.outputs.target }}
+  profile:
+    description: "Cargo profile used"
+    value: ${{ steps.build.outputs.profile }}
+  artefact_name:
+    description: "Artefact name the upload uses; set even without an upload"
+    value: ${{ steps.build.outputs.artefact_name }}
+  artefact_path:
+    description: "Artefact directory, relative to the workspace"
+    value: ${{ steps.build.outputs.artefact_path }}
+  binaries_json:
+    # yamllint disable-line rule:line-length
+    description: "JSON array of {name, path, sha256}; path is relative to artefact_path"
+    value: ${{ steps.build.outputs.binaries_json }}
+  crates_json:
+    # yamllint disable-line rule:line-length
+    description: "JSON array of {name, version, file, sha256}; file is relative to artefact_path"
+    value: ${{ steps.build.outputs.crates_json }}
+  rust_version:
+    # yamllint disable-line rule:line-length
+    description: "rust-version (MSRV) declared by the manifest's package; empty if none"
+    value: ${{ steps.build.outputs.rust_version }}
 
 runs:
   using: "composite"
   steps:
-    - name: "Friendly Name"
-      id: code
+    - name: "Build Rust project"
+      id: build
       shell: bash
       env:
-        INPUT_VALUE: ${{ inputs.input }}
-      run: |
-        # Friendly Name
-        input="$INPUT_VALUE"
-        if [ -z "$input" ]; then
-          echo "Error: mandatory input was not set/configured ❌"
-          exit 1
-        fi
+        ACTION_PATH: ${{ github.action_path }}
+        INPUT_PATH_PREFIX: ${{ inputs.path_prefix }}
+        INPUT_MANIFEST_PATH: ${{ inputs.manifest_path }}
+        INPUT_WORKSPACE: ${{ inputs.workspace }}
+        INPUT_PACKAGES: ${{ inputs.packages }}
+        INPUT_EXCLUDE: ${{ inputs.exclude }}
+        INPUT_FEATURES: ${{ inputs.features }}
+        INPUT_ALL_FEATURES: ${{ inputs.all_features }}
+        INPUT_NO_DEFAULT_FEATURES: ${{ inputs.no_default_features }}
+        INPUT_TOOLCHAIN: ${{ inputs.toolchain }}
+        INPUT_LOCKFILE_REQUIRED: ${{ inputs.lockfile_required }}
+        INPUT_SETUP_SCRIPT: ${{ inputs.setup_script }}
+        INPUT_TARGET: ${{ inputs.target }}
+        INPUT_PROFILE: ${{ inputs.profile }}
+        INPUT_CARGO_ARGS: ${{ inputs.cargo_args }}
+        INPUT_BINARIES: ${{ inputs.binaries }}
+        INPUT_PACKAGE_CRATES: ${{ inputs.package_crates }}
+        INPUT_ARTEFACT_UPLOAD: ${{ inputs.artefact_upload }}
+        INPUT_ARTEFACT_NAME: ${{ inputs.artefact_name }}
+        INPUT_ARTEFACT_PATH: ${{ inputs.artefact_path }}
+        INPUT_SUMMARY: ${{ inputs.summary }}
+      run: bash "$ACTION_PATH/scripts/rust-build.sh"
 
-        # Write the output using the multiline heredoc format with a random
-        # delimiter so that an input containing newlines cannot inject
-        # additional keys into $GITHUB_OUTPUT (output-file injection). The
-        # delimiter is built from shell-builtin randomness (no external
-        # tools such as openssl/uuidgen, which are not guaranteed on
-        # self-hosted runners) and regenerated until it is provably absent
-        # from the value being emitted.
-        delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
-        while [[ "$input" == *"$delimiter"* ]]; do
-          delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
-        done
-        {
-          printf '%s<<%s\n' 'output' "$delimiter"
-          printf '%s\n' "$input"
-          printf '%s\n' "$delimiter"
-        } >> "$GITHUB_OUTPUT"
-        echo "Action received: $input ✅"
-        echo "Action received: $input ✅" >> "$GITHUB_STEP_SUMMARY"
+    # The script sets 'upload' only after validating artefact_name and
+    # artefact_path, and only when artefact_upload is 'true' and the
+    # directory holds files.
+    - name: "Upload build artefacts"
+      if: steps.build.outputs.upload == 'true'
+      # yamllint disable-line rule:line-length
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: ${{ steps.build.outputs.artefact_name }}
+        path: ${{ steps.build.outputs.artefact_path }}
+        if-no-files-found: error
+        # The directory holds only what the script collected, which
+        # never starts with a dot; this keeps a hidden artefact_path
+        # such as .dist, which upload-artifact would otherwise skip.
+        include-hidden-files: true
