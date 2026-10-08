@@ -1686,6 +1686,70 @@ EOF
   done
 }
 
+### Names ending in a newline ###
+
+# Command substitution strips trailing newlines, which would turn each
+# of these into the name of an existing sibling.
+
+@test "runs a setup_script whose name ends in a newline, not its sibling" {
+  printf '%s\n' 'echo right > "$MOCK_ROOT/ran"' > "$project/setup.sh"$'\n'
+  printf '%s\n' 'echo wrong > "$MOCK_ROOT/ran"' > "$project/setup.sh"
+  export INPUT_SETUP_SCRIPT=$'setup.sh\n'
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(cat "$project/ran")" = right ]
+}
+
+@test "resolves a directory whose name ends in a newline, not its sibling" {
+  mkdir "$project/sub"$'\n' "$project/sub"
+  printf '%s\n' 'echo right > "$MOCK_ROOT/ran"' > "$project/sub"$'\n/setup.sh'
+  printf '%s\n' 'echo wrong > "$MOCK_ROOT/ran"' > "$project/sub/setup.sh"
+  export INPUT_SETUP_SCRIPT=$'sub\n/setup.sh'
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(cat "$project/ran")" = right ]
+}
+
+@test "refuses a manifest_path or path_prefix that ends in a newline" {
+  cp "$project/Cargo.toml" "$project/Cargo.toml"$'\n'
+  export INPUT_MANIFEST_PATH=$'Cargo.toml\n'
+  run_action
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"manifest_path must name a Cargo.toml file"* ]]
+
+  unset INPUT_MANIFEST_PATH
+  export INPUT_PATH_PREFIX=$'my project\n'
+  run_action
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"path_prefix is not a directory"* ]]
+  assert_no_cargo
+}
+
+@test "refuses an artefact_path that ends in a newline" {
+  export INPUT_BINARIES=true INPUT_ARTEFACT_PATH=$'dist\n'
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"artefact_path must resolve to a path without glob syntax"* ]]
+  [ ! -e "$project/dist" ]
+  assert_no_cargo
+}
+
+@test "fails the build when cargo_args stops Cargo before it builds" {
+  local flag
+  for flag in --help -h; do
+    export INPUT_BINARIES=true INPUT_CARGO_ARGS="$flag"
+    run_action
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Cargo exited without finishing a build; check cargo_args"* ]]
+    grep -q 'Failed at Build' "$GITHUB_STEP_SUMMARY"
+    grep -Fq '| Build | ❌ Failed |' "$GITHUB_STEP_SUMMARY"
+    [ "$(output_value binaries_json)" = "" ]
+  done
+}
+
 ### action.yaml wiring ###
 
 @test "action.yaml passes every input to the script through env" {

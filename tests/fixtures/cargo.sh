@@ -149,6 +149,11 @@ case "${1:-}" in
     fi
     ;;
   build)
+    # Like Cargo: help and exit 0, building nothing.
+    if has_flag --help "$@" || has_flag -h "$@"; then
+      echo "Compile a local package and all of its dependencies"
+      exit 0
+    fi
     profile="$(values_of --profile "$@")"
     triple="$(values_of --target "$@")"
     case "$profile" in

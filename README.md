@@ -304,7 +304,9 @@ or `Cargo.lock`.
   `--profile`, `--release`/`-r`, `--package`/`-p`, `--workspace`,
   `--exclude`, `--features`/`-F`, `--all-features`,
   `--no-default-features`, `--manifest-path` and `--message-format`.
-  The check also reads clustered short flags such as `-vr`.
+  The check also reads clustered short flags such as `-vr`. The build
+  fails when Cargo exits without reporting a finished build, as it
+  does for `--help`.
 - The action validates every output as a single line before writing
   it, and escapes values it shows in the job summary.
 

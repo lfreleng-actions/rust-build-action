@@ -156,10 +156,13 @@ split_words() {
   read -r -a words <<< "$text" || true
 }
 
+# Set 'against' to the second path, taken relative to the first unless
+# absolute. A variable, not output: command substitution would strip a
+# trailing newline from the name.
 resolve_against() {
   case "$2" in
-    /*) printf '%s' "$2" ;;
-    *) printf '%s/%s' "$1" "$2" ;;
+    /*) against="$2" ;;
+    *) against="$1/$2" ;;
   esac
 }
 
@@ -168,26 +171,37 @@ in_workspace() {
   [ "$1" = "$workspace_real" ] || [[ "$1" == "$workspace_real"/* ]]
 }
 
+# Set 'canonical' to the physical path of a directory, or return 1.
+# The trailing sentinel keeps a name that ends in a newline intact,
+# which command substitution would otherwise strip, turning the path
+# into that of a sibling.
+canonical_dir() {
+  canonical="$(cd -- "$1" 2> /dev/null && pwd -P && echo x)" || return 1
+  canonical="${canonical%$'\n'x}"
+}
+
 # Resolve a file input against path_prefix: it must exist as a regular
 # file, must not itself be a symlink, and its canonical location must
 # lie inside the workspace. Sets 'resolved' to the canonical path; it
 # runs in this shell, not a subshell, so that 'fail' ends the run.
 resolve_file() {
   local input="$1" value="$2" file dir
-  file="$(resolve_against "$project_dir" "$value")"
+  resolve_against "$project_dir" "$value"
+  file="$against"
   if [ -L "$file" ]; then
     fail "$input must not be a symlink"
   fi
   if [ ! -f "$file" ]; then
     fail "$input does not name a file below path_prefix"
   fi
-  if ! dir="$(cd -- "$(dirname -- "$file")" 2> /dev/null && pwd -P)"; then
+  if ! canonical_dir "${file%/*}/"; then
     fail "$input does not name a file below path_prefix"
   fi
+  dir="$canonical"
   if ! in_workspace "$dir"; then
     fail "$input must resolve inside the workspace"
   fi
-  resolved="$dir/$(basename -- "$file")"
+  resolved="$dir/${file##*/}"
 }
 
 # Resolve artefact_path, which need not exist yet. The deepest part
@@ -196,7 +210,8 @@ resolve_file() {
 # later creates as real directories.
 resolve_artefact_dir() {
   local candidate rest="" part existing
-  candidate="$(resolve_against "$project_dir" "$artefact_path")"
+  resolve_against "$project_dir" "$artefact_path"
+  candidate="$against"
   while [[ "$candidate" == */ ]]; do
     candidate="${candidate%/}"
   done
@@ -211,9 +226,10 @@ resolve_artefact_dir() {
     rest="$part${rest:+/$rest}"
     candidate="${candidate%/*}"
   done
-  if ! existing="$(cd -- "$candidate" 2> /dev/null && pwd -P)"; then
+  if ! canonical_dir "$candidate"; then
     fail "artefact_path must name a directory"
   fi
+  existing="$canonical"
   artefact_dir="$existing${rest:+/$rest}"
   # Below the workspace, and not path_prefix or above it: that also
   # rules out the workspace itself.
@@ -477,16 +493,18 @@ if ! command -v sha256sum > /dev/null 2>&1 \
   fail "required tool not found on PATH: sha256sum or shasum"
 fi
 
-if ! workspace_real="$(cd -- "${GITHUB_WORKSPACE:-$PWD}" 2> /dev/null && pwd -P)"; then
+if ! canonical_dir "${GITHUB_WORKSPACE:-$PWD}"; then
   fail "GITHUB_WORKSPACE is not a directory"
 fi
-if ! project_dir="$(cd -- "$(resolve_against "$workspace_real" "$path_prefix")" \
-  2> /dev/null && pwd -P)"; then
+workspace_real="$canonical"
+resolve_against "$workspace_real" "$path_prefix"
+if ! canonical_dir "$against"; then
   fail "path_prefix is not a directory"
 fi
+project_dir="$canonical"
 in_workspace "$project_dir" || fail "path_prefix must resolve inside the workspace"
 
-if [ "$(basename -- "$manifest_path")" != "Cargo.toml" ]; then
+if [ "${manifest_path##*/}" != "Cargo.toml" ]; then
   fail "manifest_path must name a Cargo.toml file"
 fi
 resolve_file manifest_path "$manifest_path"
@@ -748,12 +766,15 @@ metadata="$work_dir/metadata.json"
 in_project cargo metadata --no-deps --format-version 1 --locked \
   --manifest-path "$manifest_abs" > "$metadata"
 
-workspace_root="$(jq -er '.workspace_root | strings' "$metadata")"
-if ! workspace_root="$(cd -- "$workspace_root" 2> /dev/null && pwd -P)" \
-  || ! in_workspace "$workspace_root"; then
+# Each path is read with a trailing '/', so that command substitution
+# cannot strip a newline that ends it.
+workspace_root="$(jq -er '.workspace_root | strings | . + "/"' "$metadata")"
+if ! canonical_dir "$workspace_root" || ! in_workspace "$canonical"; then
   fail "the Cargo workspace root must lie inside the workspace"
 fi
-target_directory="$(jq -er '.target_directory | strings' "$metadata")"
+workspace_root="$canonical"
+target_directory="$(jq -er '.target_directory | strings | . + "/"' "$metadata")"
+target_directory="${target_directory%/}"
 
 rust_version="$(jq -r --arg m "$manifest_abs" \
   '[.packages[] | select(.manifest_path == $m)][0].rust_version // ""' \
@@ -913,6 +934,13 @@ in_project "${build_command[@]}" build --locked \
   ${selection_args[@]+"${selection_args[@]}"} \
   ${feature_args[@]+"${feature_args[@]}"} \
   ${extra_args[@]+"${extra_args[@]}"} > "$build_log"
+# Exit status alone is not enough: an option such as --help in
+# cargo_args makes Cargo exit 0 without building.
+if ! jq -enR '[inputs | fromjson? | objects
+    | select(.reason == "build-finished" and .success == true)]
+    | length > 0' "$build_log" > /dev/null; then
+  fail "Cargo exited without finishing a build; check cargo_args"
+fi
 build_cell="✅ Built $(md_escape "$selected_count") package(s)"
 if [ "${build_command[*]}" = "cargo auditable" ]; then
   auditable_cell="✅ cargo-auditable $(md_escape "$cargo_auditable_version")"
@@ -978,8 +1006,8 @@ produced=0
 # call checks again so that the artefact holds only what this collects.
 artefact_dir_ready=false
 make_artefact_dir() {
-  if ! mkdir -p -- "$artefact_dir" \
-    || [ "$(cd -- "$artefact_dir" && pwd -P)" != "$artefact_dir" ]; then
+  if ! mkdir -p -- "$artefact_dir" || ! canonical_dir "$artefact_dir" \
+    || [ "$canonical" != "$artefact_dir" ]; then
     fail "could not create artefact_path inside the workspace"
   fi
   if [ "$artefact_dir_ready" = "false" ] \
