@@ -9,7 +9,8 @@
 # The stages run in this order, and the first failure ends the run:
 #
 #   Check inputs -> Resolve toolchain -> Install toolchain
-#   -> Run setup script -> Inspect toolchain -> Add target -> Read metadata
+#   -> Run setup script -> Inspect toolchain -> Check cargo-auditable
+#   -> Add target -> Read metadata
 #   -> Check lockfile -> Build -> Package crates -> Collect artefacts
 #
 # Cargo, rustc, rustup and the setup script all run from path_prefix
@@ -41,6 +42,10 @@ target_input="${INPUT_TARGET-}"
 profile="${INPUT_PROFILE-release}"
 cargo_args="${INPUT_CARGO_ARGS-}"
 binaries="${INPUT_BINARIES-false}"
+auditable="${INPUT_AUDITABLE-false}"
+cargo_auditable_version="${INPUT_CARGO_AUDITABLE_VERSION-0.7.7}"
+# The outcome of the action's install-action step, when it ran.
+install_outcome="${INSTALL_OUTCOME-}"
 package_crates="${INPUT_PACKAGE_CRATES-false}"
 artefact_upload="${INPUT_ARTEFACT_UPLOAD-true}"
 artefact_name="${INPUT_ARTEFACT_NAME-}"
@@ -71,6 +76,8 @@ cargo_version=""
 rustc_version=""
 resolved_target=""
 manifest_display=""
+# Set only when auditable is 'true'.
+auditable_cell=""
 # Set only when toolchain_components or toolchain_targets name any.
 install_cell=""
 selection_cell="⏸️ Not reached"
@@ -353,6 +360,9 @@ finish() {
     add_check "Packages" "$selection_cell"
     add_check "Lockfile" "$lockfile_cell"
     add_check "Build" "$build_cell"
+    if [ -n "$auditable_cell" ]; then
+      add_check "Auditable" "$auditable_cell"
+    fi
     add_check "Binaries" "$binaries_cell"
     add_check "Crates" "$crates_cell"
     add_check "Artefact" "$artefact_cell"
@@ -378,6 +388,7 @@ fi
 for pair in "workspace:$workspace_flag" "all_features:$all_features" \
   "no_default_features:$no_default_features" \
   "lockfile_required:$lockfile_required" "binaries:$binaries" \
+  "auditable:$auditable" \
   "package_crates:$package_crates" "artefact_upload:$artefact_upload" \
   "summary:$summary"; do
   require_boolean "${pair%%:*}" "${pair#*:}"
@@ -395,6 +406,18 @@ fi
 if [ -n "$artefact_name" ] && [[ ! "$artefact_name" =~ $artefact_name_pattern ]]; then
   fail "artefact_name may contain only A-Z a-z 0-9 . _ - and must start" \
     "with a letter or digit"
+fi
+if [[ ! "$cargo_auditable_version" =~ $version_pattern ]]; then
+  fail "cargo_auditable_version must be a release version such as 0.7.7"
+fi
+if [ "$auditable" = "true" ]; then
+  if [ "$binaries" = "true" ]; then
+    auditable_cell="⏸️ Not reached"
+  else
+    auditable_cell="⚠️ No effect without binaries"
+    warn "auditable has no effect with binaries set to 'false': the build" \
+      "runs plain cargo build, and crate archives hold no binaries"
+  fi
 fi
 
 split_words "$packages_input"
@@ -681,6 +704,28 @@ echo "Toolchain: ${toolchain:-cargo on PATH} (cargo $cargo_version," \
 artefact_name="${artefact_name:-rust-build-$resolved_target}"
 set_output artefact_name "$artefact_name"
 
+### Check cargo-auditable ###
+
+# The action's install-action step puts cargo-auditable on PATH, where
+# Cargo finds it as the 'auditable' subcommand. The tool has no version
+# flag of its own ('cargo auditable --version' prints Cargo's), so this
+# checks that Cargo finds it, and the summary names the version the
+# action asked for.
+build_command=(cargo)
+if [ "$auditable" = "true" ] && [ "$binaries" = "true" ]; then
+  stage="Check cargo-auditable"
+  auditable_cell="❌ Not installed"
+  if [ "$install_outcome" = "failure" ]; then
+    fail "taiki-e/install-action could not install cargo-auditable" \
+      "$cargo_auditable_version"
+  fi
+  if ! in_project cargo auditable --version > /dev/null 2>&1; then
+    fail "Cargo cannot find cargo-auditable; it must be on PATH"
+  fi
+  build_command=(cargo auditable)
+  auditable_cell="⏸️ Not reached"
+fi
+
 ### Add target ###
 
 if [ -n "$target_input" ] && [ "$target_input" != "$host_triple" ]; then
@@ -855,17 +900,23 @@ case "$mode" in
 esac
 
 # Cargo renders diagnostics to stderr for the log and writes JSON
-# messages to stdout, which name every executable it produced.
+# messages to stdout, which name every executable it produced. With
+# auditable, 'cargo auditable build' takes the same arguments and
+# embeds the dependency list in each binary's .dep-v0 section.
 stage="Build"
 build_log="$work_dir/build.jsonl"
 build_cell="❌ Failed"
-in_project cargo build --locked --message-format=json-render-diagnostics \
+in_project "${build_command[@]}" build --locked \
+  --message-format=json-render-diagnostics \
   --manifest-path "$manifest_abs" "--profile=$profile" \
   "${target_args[@]}" \
   ${selection_args[@]+"${selection_args[@]}"} \
   ${feature_args[@]+"${feature_args[@]}"} \
   ${extra_args[@]+"${extra_args[@]}"} > "$build_log"
 build_cell="✅ Built $(md_escape "$selected_count") package(s)"
+if [ "${build_command[*]}" = "cargo auditable" ]; then
+  auditable_cell="✅ cargo-auditable $(md_escape "$cargo_auditable_version")"
+fi
 
 ### Package crates ###
 

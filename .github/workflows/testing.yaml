@@ -269,6 +269,100 @@ jobs:
             exit 1
           fi
 
+  ### cargo auditable: the dependency list lands in the binary ###
+  auditable:
+    name: "Build auditable binaries"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+        with:
+          config: '@538904e241556d101fb908b50e2a2965fa0346cf'  # v0.16.6
+
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@351661ca32ac09a36dc5ee2d536e3128f2a3c8ed  # v2.22.0
+        with:
+          egress-policy: "block"
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Checkout test-rust-project"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: lfreleng-actions/test-rust-project
+          ref: "5db6f8f6624e676d1d76f8db02a0253fee39900c"  # v0.0.1
+          path: fixture
+          persist-credentials: false
+
+      # The control: a plain build carries no dependency list.
+      - name: "Running local action: plain build"
+        id: plain
+        uses: $/
+        with:
+          path_prefix: fixture
+          binaries: "true"
+          artefact_upload: "false"
+          artefact_path: dist-plain
+
+      - name: "Running local action: auditable build"
+        id: auditable
+        uses: $/
+        with:
+          path_prefix: fixture
+          binaries: "true"
+          auditable: "true"
+          artefact_upload: "false"
+          artefact_path: dist-auditable
+
+      - name: "Install syft"
+        # yamllint disable-line rule:line-length
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: syft@1.54.0
+          fallback: none
+
+      - name: "Check the embedded dependency list"
+        shell: bash
+        env:
+          PLAIN_PATH: ${{ steps.plain.outputs.artefact_path }}
+          AUDITABLE_PATH: ${{ steps.auditable.outputs.artefact_path }}
+          SYFT_CHECK_FOR_APP_UPDATE: "false"
+        run: |
+          # Check the embedded dependency list
+          set -euo pipefail
+          name=lfreleng-test-rust-project
+          plain="$PLAIN_PATH/$name"
+          audited="$AUDITABLE_PATH/$name"
+          # Captured first: grep -q closing a pipe early would fail
+          # the writer under pipefail.
+          sections="$(readelf -S --wide "$audited")"
+          grep -F '.dep-v0' <<< "$sections"
+          sections="$(readelf -S --wide "$plain")"
+          if grep -qF '.dep-v0' <<< "$sections"; then
+            echo "::error::the plain build carries a .dep-v0 section"
+            exit 1
+          fi
+
+          syft scan "file:$audited" -o json -q > audited.json
+          syft scan "file:$plain" -o json -q > plain.json
+          jq -c '[.artifacts[] | {name, version, foundBy}]' audited.json
+          jq -e --arg n "$name" '[.artifacts[]
+            | select(.name == $n and .version == "0.1.0"
+                and .foundBy == "cargo-auditable-binary-cataloger")]
+            | length == 1' audited.json
+          jq -e '[.artifacts[]
+            | select(.foundBy == "cargo-auditable-binary-cataloger")]
+            | length == 0' plain.json
+
   ### The uploaded artefact, from a job that did not build it ###
   verify-artefact:
     name: "Verify uploaded artefact"
@@ -635,6 +729,29 @@ jobs:
           toolchain_components: "no-such-component"
           artefact_upload: "false"
 
+      - name: "Malformed cargo_auditable_version [expected failure]"
+        id: bad_auditable_version
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: fixture
+          binaries: "true"
+          auditable: "true"
+          cargo_auditable_version: "latest"
+          artefact_upload: "false"
+
+      # install-action lists no such release, and never compiles one.
+      - name: "Unavailable cargo_auditable_version [expected failure]"
+        id: missing_auditable_version
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: fixture
+          binaries: "true"
+          auditable: "true"
+          cargo_auditable_version: "0.0.1"
+          artefact_upload: "false"
+
       - name: "Verify failure outcomes"
         shell: bash
         env:
@@ -659,13 +776,21 @@ jobs:
           BAD_COMPONENT: ${{ steps.bad_component.outcome }}
           # yamllint disable-line rule:line-length
           BAD_COMPONENT_CARGO: ${{ steps.bad_component.outputs.cargo_version }}
+          BAD_AUDITABLE_VERSION: ${{ steps.bad_auditable_version.outcome }}
+          # yamllint disable-line rule:line-length
+          BAD_AUDITABLE_VERSION_TOOLCHAIN: ${{ steps.bad_auditable_version.outputs.toolchain_kind }}
+          # yamllint disable-line rule:line-length
+          MISSING_AUDITABLE_VERSION: ${{ steps.missing_auditable_version.outcome }}
+          # yamllint disable-line rule:line-length
+          MISSING_AUDITABLE_VERSION_CARGO: ${{ steps.missing_auditable_version.outputs.cargo_version }}
         run: |
           # Verify failure outcomes
           set -euo pipefail
           status=0
           for name in BAD_BOOLEAN EXCLUDE_PACKAGES GLOB_ARTEFACT_PATH \
             MISSING_MANIFEST OUTSIDE_WORKSPACE RESERVED_ARGS BAD_TARGET \
-            NO_LOCKFILE COMPILE_ERROR BAD_COMPONENT; do
+            NO_LOCKFILE COMPILE_ERROR BAD_COMPONENT BAD_AUDITABLE_VERSION \
+            MISSING_AUDITABLE_VERSION; do
             if [ "${!name}" = failure ]; then
               echo "✅ $name failed as expected"
             else
@@ -682,6 +807,10 @@ jobs:
           [ -n "$COMPILE_ERROR_CARGO" ] || status=1
           [ -z "$COMPILE_ERROR_BINARIES" ] || status=1
           [ ! -e fixtures/nolock/Cargo.lock ] || status=1
-          # rustup rejects the component before Cargo runs.
+          # The component fails before Cargo runs; a malformed version
+          # fails the input checks; an unavailable one fails after the
+          # toolchain is inspected, before the build.
           [ -z "$BAD_COMPONENT_CARGO" ] || status=1
+          [ -z "$BAD_AUDITABLE_VERSION_TOOLCHAIN" ] || status=1
+          [ -n "$MISSING_AUDITABLE_VERSION_CARGO" ] || status=1
           exit "$status"

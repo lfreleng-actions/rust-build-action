@@ -84,30 +84,32 @@ and nothing else.
 
 <!-- markdownlint-disable MD013 -->
 
-| Name                 | Default      | Description                                                                           |
-| -------------------- | ------------ | ------------------------------------------------------------------------------------- |
-| path_prefix          | `.`          | Directory holding the project, inside the workspace                                   |
-| manifest_path        | `Cargo.toml` | Path to `Cargo.toml`, relative to `path_prefix` or absolute; must not be a symlink    |
-| workspace            | `true`       | Build every workspace member (`--workspace`); a non-empty `packages` replaces it      |
-| packages             | `''`         | Whitespace-separated packages to build (`--package`), in place of `--workspace`       |
-| exclude              | `''`         | Whitespace-separated packages to skip (`--exclude`); needs `workspace`, no `packages` |
-| features             | `''`         | Features to enable, separated by whitespace or commas; `package/feature` allowed      |
-| all_features         | `false`      | Enable all features (`--all-features`)                                                |
-| no_default_features  | `false`      | Disable default features (`--no-default-features`)                                    |
-| toolchain            | `''`         | rustup channel to use; empty uses the toolchain that `path_prefix` selects            |
-| toolchain_components | `''`         | rustup components to install into the channel, separated by whitespace or commas      |
-| toolchain_targets    | `''`         | Target triples to install into the channel, separated by whitespace or commas         |
-| lockfile_required    | `false`      | Fail when `Cargo.lock` is missing, instead of generating one                          |
-| setup_script         | `''`         | Script to run with bash before Cargo, relative to `path_prefix`                       |
-| target               | `''`         | Target triple to build for; empty builds for the host                                 |
-| profile              | `release`    | Cargo profile: `dev`, `release` or a custom profile name                              |
-| cargo_args           | `''`         | Extra `cargo build` arguments, split on whitespace and never run by a shell           |
-| binaries             | `false`      | Copy built binaries into `artefact_path` with a `SHA256SUMS` file                     |
-| package_crates       | `false`      | Package publishable crates into `artefact_path/crates` with `crates.json`             |
-| artefact_upload      | `true`       | Upload `artefact_path` as a workflow artefact when it holds files                     |
-| artefact_name        | `''`         | Artefact name; empty uses `rust-build-<target triple>`                                |
-| artefact_path        | `dist`       | Directory for binaries and crates, relative to `path_prefix`; must be empty or new    |
-| summary              | `true`       | Write a job summary                                                                   |
+| Name                    | Default      | Description                                                                            |
+| ----------------------- | ------------ | -------------------------------------------------------------------------------------- |
+| path_prefix             | `.`          | Directory holding the project, inside the workspace                                    |
+| manifest_path           | `Cargo.toml` | Path to `Cargo.toml`, relative to `path_prefix` or absolute; must not be a symlink     |
+| workspace               | `true`       | Build every workspace member (`--workspace`); a non-empty `packages` replaces it       |
+| packages                | `''`         | Whitespace-separated packages to build (`--package`), in place of `--workspace`        |
+| exclude                 | `''`         | Whitespace-separated packages to skip (`--exclude`); needs `workspace`, no `packages`  |
+| features                | `''`         | Features to enable, separated by whitespace or commas; `package/feature` allowed       |
+| all_features            | `false`      | Enable all features (`--all-features`)                                                 |
+| no_default_features     | `false`      | Disable default features (`--no-default-features`)                                     |
+| toolchain               | `''`         | rustup channel to use; empty uses the toolchain that `path_prefix` selects             |
+| toolchain_components    | `''`         | rustup components to install into the channel, separated by whitespace or commas       |
+| toolchain_targets       | `''`         | Target triples to install into the channel, separated by whitespace or commas          |
+| lockfile_required       | `false`      | Fail when `Cargo.lock` is missing, instead of generating one                           |
+| setup_script            | `''`         | Script to run with bash before Cargo, relative to `path_prefix`                        |
+| target                  | `''`         | Target triple to build for; empty builds for the host                                  |
+| profile                 | `release`    | Cargo profile: `dev`, `release` or a custom profile name                               |
+| cargo_args              | `''`         | Extra `cargo build` arguments, split on whitespace and never run by a shell            |
+| binaries                | `false`      | Copy built binaries into `artefact_path` with a `SHA256SUMS` file                      |
+| auditable               | `false`      | Build binaries with `cargo auditable`, embedding the dependency list; needs `binaries` |
+| cargo_auditable_version | `0.7.7`      | `cargo-auditable` release to install when `auditable` is `true`                        |
+| package_crates          | `false`      | Package publishable crates into `artefact_path/crates` with `crates.json`              |
+| artefact_upload         | `true`       | Upload `artefact_path` as a workflow artefact when it holds files                      |
+| artefact_name           | `''`         | Artefact name; empty uses `rust-build-<target triple>`                                 |
+| artefact_path           | `dist`       | Directory for binaries and crates, relative to `path_prefix`; must be empty or new     |
+| summary                 | `true`       | Write a job summary                                                                    |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -136,7 +138,15 @@ and nothing else.
 The action runs these stages in order and stops at the first failure.
 The job summary names the stage that failed.
 
-1. **Check inputs.** Rejects any invalid input before running anything.
+Before them, with `auditable` and `binaries` both `true` and a
+well-formed `cargo_auditable_version`, a preliminary step installs
+`cargo-auditable` through `taiki-e/install-action`: a pinned,
+checksummed download that runs no project code. It checks those
+three inputs and no others, so it can run for a build that then fails
+at Check inputs.
+
+1. **Check inputs.** Rejects any invalid input before running Cargo,
+   rustup or the setup script.
    Error messages name the input and never echo its value.
 2. **Resolve toolchain.** With an empty `toolchain`,
    `rustup show active-toolchain` names the toolchain that
@@ -153,10 +163,13 @@ The job summary names the stage that failed.
    `-sys` crates need.
 5. **Inspect toolchain.** Records the Cargo and rustc versions and
    the host triple.
-6. **Add target.** For a non-host `target` on a channel toolchain,
+6. **Check cargo-auditable.** With `auditable` and `binaries`, checks
+   that Cargo finds the `cargo-auditable` the action installed; see
+   [Auditable binaries](#auditable-binaries).
+7. **Add target.** For a non-host `target` on a channel toolchain,
    runs `rustup target add`, unless `toolchain_targets` already
    installed it. Other toolchains must already have it.
-7. **Read metadata.** Runs `cargo metadata` and works out the
+8. **Read metadata.** Runs `cargo metadata` and works out the
    selected packages the same way Cargo does: the named ones, every
    member less exclusions, or with `workspace: false` the default
    members (the manifest's own package, else
@@ -166,21 +179,22 @@ The job summary names the stage that failed.
    `package_crates` on Cargo older than 1.90, the action fails here
    (as "Check packaging") when one crate it would package depends on
    another; see [Notes](#notes).
-8. **Check lockfile.** Without `Cargo.lock`, the action fails when
+9. **Check lockfile.** Without `Cargo.lock`, the action fails when
    `lockfile_required` is `true`. Otherwise it runs
    `cargo generate-lockfile` and warns. Every later Cargo command
    runs with `--locked`.
-9. **Build.** Runs `cargo build` with the selected profile, target,
-   packages and features, then `cargo_args`. The action always passes
-   `--target`, the host triple included, so `build.target` in Cargo
-   configuration cannot build for a target the outputs do not name.
-   Cargo then writes to `target/<triple>/<profile>` and, as with any
-   explicit `--target`, does not pass `RUSTFLAGS` to build scripts
-   and proc macros.
-10. **Package crates.** With `package_crates`, runs `cargo package`
+10. **Build.** Runs `cargo build`, or `cargo auditable build` with
+    `auditable` and `binaries`, with the selected profile, target,
+    packages and features, then `cargo_args`. The action always passes
+    `--target`, the host triple included, so `build.target` in Cargo
+    configuration cannot build for a target the outputs do not name.
+    Cargo then writes to `target/<triple>/<profile>` and, as with any
+    explicit `--target`, does not pass `RUSTFLAGS` to build scripts
+    and proc macros.
+11. **Package crates.** With `package_crates`, runs `cargo package`
     for the selected packages that Cargo may publish, skipping those
     with `publish = false`.
-11. **Collect artefacts.** Copies binaries to the top of
+12. **Collect artefacts.** Copies binaries to the top of
     `artefact_path` with a `SHA256SUMS` file covering them. Copies
     `.crate` files to `artefact_path/crates`, and writes
     `crates.json` at the top of `artefact_path`. Then uploads
@@ -227,6 +241,27 @@ digit, followed by letters, digits, `_`, `.` or `-`.
   Without rustup, either list fails the build.
 
 The job summary lists what the action installed.
+
+### Auditable binaries
+
+With `auditable: true` and `binaries: true`, the action builds with
+[`cargo auditable`](https://github.com/rust-secure-code/cargo-auditable),
+which embeds the project's dependency list, compressed JSON, in a
+`.dep-v0` linker section of each binary. Scanners such as syft and
+Grype read it from a released binary later, without the source tree
+or `Cargo.lock`.
+
+- The action installs `cargo-auditable` at `cargo_auditable_version`
+  through `taiki-e/install-action`, as a prebuilt, checksummed release
+  download; it never compiles the tool on the runner. A version that
+  `install-action` does not list fails the build.
+- `cargo auditable build` takes the same arguments as `cargo build`,
+  and runs with the same toolchain pin and environment scrub.
+- With `binaries: false`, `auditable` has no effect and the action
+  warns: Cargo builds as usual, and `.crate` archives hold source
+  code, not binaries.
+- `cargo-auditable` has no version flag of its own, so the job summary
+  names the version the action asked `install-action` for.
 
 ### Security
 

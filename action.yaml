@@ -7,12 +7,12 @@ name: "🦀 Rust Build"
 # yamllint disable-line rule:line-length
 description: "Builds a Rust project with Cargo, optionally collecting its binaries and packaging its crates"
 # Stages: validate inputs, resolve the toolchain once and install it
-# with any requested components and targets, run an optional
-# setup script, add the target, read metadata, check the lockfile,
-# 'cargo build', 'cargo package', then gather binaries and crates
-# with checksums into artefact_path and upload them. Holds no
-# credentials and needs no 'id-token' permission; attest and sign the
-# uploaded artefact in a separate job.
+# with any requested components and targets, run an optional setup
+# script, add the target, read metadata, check the lockfile, 'cargo
+# build' (or 'cargo auditable build'), 'cargo package', then gather
+# binaries and crates with checksums into artefact_path and upload
+# them. Holds no credentials and needs no 'id-token' permission;
+# attest and sign the uploaded artefact in a separate job.
 
 inputs:
   # Optional
@@ -92,6 +92,15 @@ inputs:
     description: "Copy built binaries into artefact_path with SHA256SUMS ('true'/'false')"
     required: false
     default: "false"
+  auditable:
+    # yamllint disable-line rule:line-length
+    description: "Build binaries with 'cargo auditable', embedding the dependency list; needs binaries ('true'/'false')"
+    required: false
+    default: "false"
+  cargo_auditable_version:
+    description: "cargo-auditable release to install when auditable is 'true'"
+    required: false
+    default: "0.7.7"
   package_crates:
     # yamllint disable-line rule:line-length
     description: "Package publishable crates into artefact_path/crates with crates.json ('true'/'false')"
@@ -157,11 +166,38 @@ outputs:
 runs:
   using: "composite"
   steps:
+    # Names cargo-auditable@<version> only for an auditable binary
+    # build with valid inputs; the build step rejects invalid ones.
+    # This and the install run before the build step checks the other
+    # inputs (README: Implementation Details).
+    - name: "Select cargo tools"
+      id: tools
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        INPUT_AUDITABLE: ${{ inputs.auditable }}
+        INPUT_BINARIES: ${{ inputs.binaries }}
+        INPUT_CARGO_AUDITABLE_VERSION: ${{ inputs.cargo_auditable_version }}
+      run: bash "$ACTION_PATH/scripts/select-tools.sh"
+
+    # A prebuilt, checksummed release; never compiled on the runner.
+    # The build step reports a failure here in the job summary.
+    - name: "Install cargo tools"
+      id: install
+      if: steps.tools.outputs.tools != ''
+      continue-on-error: true
+      # yamllint disable-line rule:line-length
+      uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+      with:
+        tool: ${{ steps.tools.outputs.tools }}
+        fallback: none
+
     - name: "Build Rust project"
       id: build
       shell: bash
       env:
         ACTION_PATH: ${{ github.action_path }}
+        INSTALL_OUTCOME: ${{ steps.install.outcome }}
         INPUT_PATH_PREFIX: ${{ inputs.path_prefix }}
         INPUT_MANIFEST_PATH: ${{ inputs.manifest_path }}
         INPUT_WORKSPACE: ${{ inputs.workspace }}
@@ -179,6 +215,8 @@ runs:
         INPUT_PROFILE: ${{ inputs.profile }}
         INPUT_CARGO_ARGS: ${{ inputs.cargo_args }}
         INPUT_BINARIES: ${{ inputs.binaries }}
+        INPUT_AUDITABLE: ${{ inputs.auditable }}
+        INPUT_CARGO_AUDITABLE_VERSION: ${{ inputs.cargo_auditable_version }}
         INPUT_PACKAGE_CRATES: ${{ inputs.package_crates }}
         INPUT_ARTEFACT_UPLOAD: ${{ inputs.artefact_upload }}
         INPUT_ARTEFACT_NAME: ${{ inputs.artefact_name }}

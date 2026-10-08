@@ -1563,6 +1563,129 @@ app_depends_on() {
   [ "$output" = $'512 B\n4.0 KiB\n12.3 MiB' ]
 }
 
+### Auditable ###
+
+@test "builds binaries with cargo auditable, scrubbed and pinned" {
+  export CARGO_REGISTRY_TOKEN=secret-1 ACTIONS_ID_TOKEN_REQUEST_TOKEN=secret-2 \
+    CARGO_REGISTRIES_PRIVATE_TOKEN=secret-3 GITHUB_ENV="$workdir/env file"
+  export INPUT_BINARIES=true INPUT_AUDITABLE=true MOCK_TOOLCHAIN=1.85.0
+  run_action
+
+  [ "$status" -eq 0 ]
+  grep -qx 'auditable --version' "$MOCK_CARGO_LOG"
+  [ "$(grep '^auditable build ' "$MOCK_CARGO_LOG")" \
+    = "auditable $default_build --workspace" ]
+  [ -z "$(build_call)" ]
+  [ "$(env_field 4)" = "" ]
+  [ "$(grep '^auditable|' "$MOCK_CARGO_ENV" | cut -d'|' -f3 | sort -u)" = 1.85.0 ]
+  [ "$(output_value binaries_json | jq length)" -eq 3 ]
+  grep -Fq '| Auditable | ✅ cargo-auditable 0.7.7 |' "$GITHUB_STEP_SUMMARY"
+
+  export INPUT_CARGO_AUDITABLE_VERSION=0.6.9-rc.1 INPUT_ARTEFACT_PATH=dist2
+  run_action
+  [ "$status" -eq 0 ]
+  grep -Fq '| Auditable | ✅ cargo-auditable 0.6.9-rc.1 |' "$GITHUB_STEP_SUMMARY"
+}
+
+@test "warns that auditable has no effect without binaries" {
+  export INPUT_AUDITABLE=true INPUT_PACKAGE_CRATES=true
+  run_action
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"::warning title=rust-build::auditable has no effect with binaries set to 'false'"* ]]
+  [ "$(build_call)" = "$default_build --workspace" ]
+  run ! grep -q '^auditable' "$MOCK_CARGO_LOG"
+  grep -Fq '| Auditable | ⚠️ No effect without binaries |' "$GITHUB_STEP_SUMMARY"
+}
+
+@test "leaves the build and summary alone when auditable is 'false'" {
+  export INPUT_BINARIES=true
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(build_call)" = "$default_build --workspace" ]
+  run ! grep -q '^auditable' "$MOCK_CARGO_LOG"
+  run ! grep -q '| Auditable |' "$GITHUB_STEP_SUMMARY"
+}
+
+@test "rejects invalid auditable and cargo_auditable_version without echoing them" {
+  local bad
+  for bad in True yes 1 ''; do
+    export INPUT_AUDITABLE="$bad"
+    run_action
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"auditable must be 'true' or 'false'"* ]]
+  done
+  export INPUT_AUDITABLE=true INPUT_BINARIES=true
+  for bad in latest 1.2 v0.7.7 '0.7.7,cargo-binstall' '0.7.7 x' '0.7.7@1' \
+    '0.7.7::warning' ''; do
+    export INPUT_CARGO_AUDITABLE_VERSION="$bad"
+    run_action
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"cargo_auditable_version must be a release version such as 0.7.7"* ]]
+    [ -z "$bad" ] || [[ "$output" != *"$bad"* ]]
+  done
+  assert_no_cargo
+}
+
+@test "fails at 'Check cargo-auditable' when it is not installed" {
+  export INPUT_BINARIES=true INPUT_AUDITABLE=true INSTALL_OUTCOME=failure
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"taiki-e/install-action could not install cargo-auditable 0.7.7"* ]]
+  grep -q 'Failed at Check cargo-auditable' "$GITHUB_STEP_SUMMARY"
+  grep -Fq '| Auditable | ❌ Not installed |' "$GITHUB_STEP_SUMMARY"
+  run ! grep -Eq '^(auditable )?build' "$MOCK_CARGO_LOG"
+
+  export INSTALL_OUTCOME=success MOCK_NO_AUDITABLE=true
+  : > "$MOCK_CARGO_LOG"
+  run_action
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Cargo cannot find cargo-auditable; it must be on PATH"* ]]
+  grep -q 'Failed at Check cargo-auditable' "$GITHUB_STEP_SUMMARY"
+  run ! grep -Eq '^(auditable )?build' "$MOCK_CARGO_LOG"
+}
+
+@test "select-tools.sh names cargo-auditable only for an auditable binary build" {
+  local selector="$repo_dir/scripts/select-tools.sh" case expected
+  while IFS='|' read -r case expected; do
+    read -r INPUT_AUDITABLE INPUT_BINARIES INPUT_CARGO_AUDITABLE_VERSION <<< "$case"
+    export INPUT_AUDITABLE INPUT_BINARIES INPUT_CARGO_AUDITABLE_VERSION
+    : > "$GITHUB_OUTPUT"
+    run "$BASH" "$selector"
+    [ "$status" -eq 0 ]
+    [ "$(cat "$GITHUB_OUTPUT")" = "tools=$expected" ]
+  done <<'EOF'
+true true 0.7.7|cargo-auditable@0.7.7
+true true 0.6.9-rc.1|cargo-auditable@0.6.9-rc.1
+true false 0.7.7|
+false true 0.7.7|
+True true 0.7.7|
+true TRUE 0.7.7|
+true true latest|
+true true 0.7.7,cargo-binstall|
+EOF
+}
+
+@test "select-tools.sh and rust-build.sh accept the same versions" {
+  local version selected
+  export INPUT_AUDITABLE=true INPUT_BINARIES=true
+  for version in 0.7.7 10.20.30 0.7.7-rc.1 0.7.7+b.2 0.7 0.7.7. v0.7.7 \
+    0.7.7-rc_1 0.7.7@x '0.7.7 ' latest; do
+    export INPUT_CARGO_AUDITABLE_VERSION="$version"
+    : > "$GITHUB_OUTPUT"
+    "$BASH" "$repo_dir/scripts/select-tools.sh"
+    selected="$(cat "$GITHUB_OUTPUT")"
+    run_action
+    if [ "$selected" = "tools=" ]; then
+      [[ "$output" == *"cargo_auditable_version must be"* ]]
+    else
+      [[ "$output" != *"cargo_auditable_version must be"* ]]
+    fi
+  done
+}
+
 ### action.yaml wiring ###
 
 @test "action.yaml passes every input to the script through env" {

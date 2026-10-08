@@ -14,6 +14,9 @@
 #   tool    0.0.1  crates/tool/Cargo.toml   bin tool, publish = false
 #
 # MOCK_VIRTUAL=true drops 'app', leaving a virtual workspace.
+#
+# 'cargo auditable <args>' runs as 'cargo <args>', as the real
+# subcommand does, unless MOCK_NO_AUDITABLE is 'true'.
 
 set -euo pipefail
 
@@ -24,6 +27,14 @@ printf '%s\n' "$log_args" >> "$MOCK_CARGO_LOG"
 # shellcheck source=SCRIPTDIR/record-env.sh
 source "$MOCK_FIXTURES/record-env.sh"
 record_env "${1:-}"
+
+if [ "${1:-}" = "auditable" ]; then
+  if [ "${MOCK_NO_AUDITABLE:-false}" = "true" ]; then
+    echo "error: no such command: \`auditable\`" >&2
+    exit 101
+  fi
+  shift
+fi
 
 if [ "${MOCK_FAIL:-}" = "${1:-}" ]; then
   echo "error: mock cargo ${1:-} failed" >&2
