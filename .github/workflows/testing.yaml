@@ -173,6 +173,102 @@ jobs:
             echo "crate_sha256=$(jq -r '.[0].sha256' <<< "$CRATES_JSON")"
           } >> "$GITHUB_OUTPUT"
 
+  ### Toolchain components and targets, with auto-install off ###
+  toolchain-install:
+    name: "Install toolchain components and targets"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+        with:
+          config: '@538904e241556d101fb908b50e2a2965fa0346cf'  # v0.16.6
+
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@351661ca32ac09a36dc5ee2d536e3128f2a3c8ed  # v2.22.0
+        with:
+          egress-policy: "block"
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Checkout test-rust-project"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: lfreleng-actions/test-rust-project
+          ref: "5db6f8f6624e676d1d76f8db02a0253fee39900c"  # v0.0.1
+          path: fixture
+          persist-credentials: false
+
+      # Neither version ships on the runner image. With auto-install
+      # off, only the action's own 'rustup toolchain install' can
+      # provide them.
+      - name: "Running local action: components and targets"
+        id: extras
+        uses: $/
+        env:
+          RUSTUP_AUTO_INSTALL: "0"
+        with:
+          path_prefix: fixture
+          toolchain: "1.90.0"
+          toolchain_components: "clippy"
+          toolchain_targets: "wasm32-unknown-unknown, x86_64-unknown-linux-musl"
+          target: x86_64-unknown-linux-musl
+          binaries: "true"
+          artefact_upload: "false"
+          artefact_path: dist-extras
+
+      - name: "Running local action: toolchain alone"
+        id: alone
+        uses: $/
+        env:
+          RUSTUP_AUTO_INSTALL: "0"
+        with:
+          path_prefix: fixture
+          toolchain: "1.89.0"
+          artefact_upload: "false"
+          artefact_path: dist-alone
+
+      - name: "Check the installed components and targets"
+        shell: bash
+        env:
+          EXTRAS_TOOLCHAIN: ${{ steps.extras.outputs.toolchain }}
+          EXTRAS_RUSTC: ${{ steps.extras.outputs.rustc_version }}
+          EXTRAS_TARGET: ${{ steps.extras.outputs.target }}
+          EXTRAS_BINARIES: ${{ steps.extras.outputs.binaries_json }}
+          ALONE_RUSTC: ${{ steps.alone.outputs.rustc_version }}
+        run: |
+          # Check the installed components and targets
+          set -euo pipefail
+          [ "$EXTRAS_TOOLCHAIN" = 1.90.0 ] && [ "$EXTRAS_RUSTC" = 1.90.0 ]
+          [ "$EXTRAS_TARGET" = x86_64-unknown-linux-musl ]
+          [ "$ALONE_RUSTC" = 1.89.0 ]
+          jq -e 'length == 1' <<< "$EXTRAS_BINARIES"
+
+          components="$(rustup component list --installed --toolchain 1.90.0)"
+          targets="$(rustup target list --installed --toolchain 1.90.0)"
+          echo "1.90.0 components: $components" | tr '\n' ' '; echo
+          echo "1.90.0 targets: $targets" | tr '\n' ' '; echo
+          grep -q '^clippy-' <<< "$components"
+          grep -qx wasm32-unknown-unknown <<< "$targets"
+          grep -qx x86_64-unknown-linux-musl <<< "$targets"
+          RUSTUP_TOOLCHAIN=1.90.0 cargo clippy --version
+
+          # The minimal profile, not the default that auto-install uses.
+          alone="$(rustup component list --installed --toolchain 1.89.0)"
+          echo "1.89.0 components: $alone" | tr '\n' ' '; echo
+          if grep -Eq '^(rust-docs|clippy|rustfmt)-' <<< "$alone"; then
+            echo "::error::1.89.0 holds more than the minimal profile"
+            exit 1
+          fi
+
   ### The uploaded artefact, from a job that did not build it ###
   verify-artefact:
     name: "Verify uploaded artefact"
@@ -529,6 +625,16 @@ jobs:
           binaries: "true"
           artefact_upload: "false"
 
+      - name: "Unknown toolchain component [expected failure]"
+        id: bad_component
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: fixture
+          toolchain: "1.90.0"
+          toolchain_components: "no-such-component"
+          artefact_upload: "false"
+
       - name: "Verify failure outcomes"
         shell: bash
         env:
@@ -550,13 +656,16 @@ jobs:
           COMPILE_ERROR_CARGO: ${{ steps.compile_error.outputs.cargo_version }}
           # yamllint disable-line rule:line-length
           COMPILE_ERROR_BINARIES: ${{ steps.compile_error.outputs.binaries_json }}
+          BAD_COMPONENT: ${{ steps.bad_component.outcome }}
+          # yamllint disable-line rule:line-length
+          BAD_COMPONENT_CARGO: ${{ steps.bad_component.outputs.cargo_version }}
         run: |
           # Verify failure outcomes
           set -euo pipefail
           status=0
           for name in BAD_BOOLEAN EXCLUDE_PACKAGES GLOB_ARTEFACT_PATH \
             MISSING_MANIFEST OUTSIDE_WORKSPACE RESERVED_ARGS BAD_TARGET \
-            NO_LOCKFILE COMPILE_ERROR; do
+            NO_LOCKFILE COMPILE_ERROR BAD_COMPONENT; do
             if [ "${!name}" = failure ]; then
               echo "✅ $name failed as expected"
             else
@@ -573,4 +682,6 @@ jobs:
           [ -n "$COMPILE_ERROR_CARGO" ] || status=1
           [ -z "$COMPILE_ERROR_BINARIES" ] || status=1
           [ ! -e fixtures/nolock/Cargo.lock ] || status=1
+          # rustup rejects the component before Cargo runs.
+          [ -z "$BAD_COMPONENT_CARGO" ] || status=1
           exit "$status"

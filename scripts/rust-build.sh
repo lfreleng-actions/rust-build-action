@@ -8,8 +8,8 @@
 # Inputs arrive as INPUT_* environment variables (see action.yaml).
 # The stages run in this order, and the first failure ends the run:
 #
-#   Check inputs -> Resolve toolchain -> Run setup script
-#   -> Inspect toolchain -> Add target -> Read metadata
+#   Check inputs -> Resolve toolchain -> Install toolchain
+#   -> Run setup script -> Inspect toolchain -> Add target -> Read metadata
 #   -> Check lockfile -> Build -> Package crates -> Collect artefacts
 #
 # Cargo, rustc, rustup and the setup script all run from path_prefix
@@ -33,6 +33,8 @@ features_input="${INPUT_FEATURES-}"
 all_features="${INPUT_ALL_FEATURES-false}"
 no_default_features="${INPUT_NO_DEFAULT_FEATURES-false}"
 toolchain_input="${INPUT_TOOLCHAIN-}"
+components_input="${INPUT_TOOLCHAIN_COMPONENTS-}"
+targets_input="${INPUT_TOOLCHAIN_TARGETS-}"
 lockfile_required="${INPUT_LOCKFILE_REQUIRED-false}"
 setup_script="${INPUT_SETUP_SCRIPT-}"
 target_input="${INPUT_TARGET-}"
@@ -48,6 +50,7 @@ summary="${INPUT_SUMMARY-true}"
 readonly name_pattern='^[A-Za-z0-9_][A-Za-z0-9_-]*$'
 readonly feature_pattern='^([A-Za-z0-9_][A-Za-z0-9_-]*/)?[A-Za-z0-9_][A-Za-z0-9_+.-]*$'
 readonly channel_pattern='^[A-Za-z0-9][A-Za-z0-9._+-]*$'
+readonly rustup_name_pattern='^[A-Za-z0-9][A-Za-z0-9_.-]*$'
 readonly triple_pattern='^[a-z0-9_.]+(-[a-z0-9_.]+){1,4}$'
 readonly profile_pattern='^[A-Za-z][A-Za-z0-9_-]{0,63}$'
 readonly artefact_name_pattern='^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$'
@@ -68,6 +71,8 @@ cargo_version=""
 rustc_version=""
 resolved_target=""
 manifest_display=""
+# Set only when toolchain_components or toolchain_targets name any.
+install_cell=""
 selection_cell="⏸️ Not reached"
 lockfile_cell="⏸️ Not reached"
 build_cell="⏸️ Not reached"
@@ -334,6 +339,9 @@ finish() {
       none) add_check "Toolchain" \
         "cargo $(md_escape "${cargo_version:-?}") on PATH, no rustup" ;;
     esac
+    if [ -n "$install_cell" ]; then
+      add_check "Components and targets" "$install_cell"
+    fi
     if [ -n "$resolved_target" ]; then
       if [ -n "$target_input" ]; then
         add_check "Target" "$(md_code "$resolved_target")"
@@ -403,6 +411,18 @@ for word in ${excludes[@]+"${excludes[@]}"}; do
 done
 for word in ${features[@]+"${features[@]}"}; do
   [[ "$word" =~ $feature_pattern ]] || fail "features must list feature names"
+done
+split_words "$components_input" commas
+components=(${words[@]+"${words[@]}"})
+split_words "$targets_input" commas
+toolchain_targets=(${words[@]+"${words[@]}"})
+for word in ${components[@]+"${components[@]}"}; do
+  [[ "$word" =~ $rustup_name_pattern ]] \
+    || fail "toolchain_components must list rustup component names"
+done
+for word in ${toolchain_targets[@]+"${toolchain_targets[@]}"}; do
+  [[ "$word" =~ $rustup_name_pattern ]] \
+    || fail "toolchain_targets must list target triples"
 done
 # A non-empty packages replaces --workspace, which would otherwise make
 # Cargo ignore every --package; exclude only applies to --workspace.
@@ -546,6 +566,80 @@ fi
 set_output toolchain "$toolchain"
 set_output toolchain_kind "$toolchain_kind"
 
+### Install toolchain ###
+
+# A toolchain input makes rustup ignore rust-toolchain.toml, and with
+# it the components and targets that file lists; callers pass those
+# through toolchain_components and toolchain_targets. One 'rustup
+# toolchain install' installs a missing toolchain with the minimal
+# profile, or adds them to the installed one, keeping an exact version
+# such as 1.90.0 as it is (a moving channel such as stable updates).
+# A channel named by the toolchain input alone is installed only when
+# missing, rather than left to rustup's auto-install, which installs
+# the default profile and which RUSTUP_AUTO_INSTALL=0 turns off. The
+# probe leaves an installed channel as it is, and keeps a toolchain
+# from 'rustup toolchain link', which install rejects, working.
+extras=()
+if [ "${#components[@]}" -gt 0 ]; then
+  extras+=("components $(md_code "${components[*]}")")
+fi
+if [ "${#toolchain_targets[@]}" -gt 0 ]; then
+  extras+=("targets $(md_code "${toolchain_targets[*]}")")
+fi
+targets_installed=false
+if [ "${#extras[@]}" -gt 0 ]; then
+  install_cell="⏸️ Not reached"
+fi
+stage="Install toolchain"
+case "$toolchain_kind" in
+  channel)
+    install="${#extras[@]}"
+    if [ "$install" -eq 0 ] && [ -n "$toolchain_input" ] \
+      && ! in_project env RUSTUP_AUTO_INSTALL=0 \
+        rustup which --toolchain "$toolchain_pin" rustc > /dev/null 2>&1; then
+      install=1
+    fi
+    if [ "$install" -gt 0 ]; then
+      install_args=(toolchain install "$toolchain_pin" --profile minimal
+        --no-self-update)
+      if [ "${#components[@]}" -gt 0 ]; then
+        install_args+=(--component "$(IFS=,; printf '%s' "${components[*]}")")
+      fi
+      if [ "${#toolchain_targets[@]}" -gt 0 ]; then
+        install_args+=(--target "$(IFS=,; printf '%s' "${toolchain_targets[*]}")")
+      fi
+      echo "Running: rustup ${install_args[*]}"
+      if ! in_project rustup "${install_args[@]}"; then
+        if [ -n "$install_cell" ]; then
+          install_cell="❌ rustup could not install them"
+        fi
+        fail "rustup could not install toolchain $toolchain_pin with the" \
+          "requested toolchain_components and toolchain_targets"
+      fi
+      if [ "${#extras[@]}" -gt 0 ]; then
+        install_cell="✅ ${extras[0]}"
+        if [ "${#extras[@]}" -gt 1 ]; then
+          install_cell+=", ${extras[1]}"
+        fi
+        targets_installed=true
+      fi
+    fi
+    ;;
+  path)
+    if [ "${#extras[@]}" -gt 0 ]; then
+      install_cell="⚠️ Ignored for a path toolchain"
+      warn "toolchain_components and toolchain_targets are ignored for a" \
+        "path toolchain; install them into that toolchain instead"
+    fi
+    ;;
+  none)
+    if [ "${#extras[@]}" -gt 0 ]; then
+      install_cell="❌ Needs rustup"
+      fail "toolchain_components and toolchain_targets need rustup on PATH"
+    fi
+    ;;
+esac
+
 ### Run setup script ###
 
 if [ -n "$setup_abs" ]; then
@@ -591,7 +685,10 @@ set_output artefact_name "$artefact_name"
 
 if [ -n "$target_input" ] && [ "$target_input" != "$host_triple" ]; then
   stage="Add target"
-  if [ "$toolchain_kind" = "channel" ]; then
+  if [ "$targets_installed" = "true" ] \
+    && [[ " ${toolchain_targets[*]} " == *" $target_input "* ]]; then
+    echo "Target $target_input came with toolchain_targets"
+  elif [ "$toolchain_kind" = "channel" ]; then
     in_project rustup target add --toolchain "$toolchain_pin" "$target_input"
   else
     warn "rustup cannot add target $target_input to a $toolchain_kind" \

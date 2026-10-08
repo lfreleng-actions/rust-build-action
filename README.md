@@ -84,28 +84,30 @@ and nothing else.
 
 <!-- markdownlint-disable MD013 -->
 
-| Name                | Default      | Description                                                                           |
-| ------------------- | ------------ | ------------------------------------------------------------------------------------- |
-| path_prefix         | `.`          | Directory holding the project, inside the workspace                                   |
-| manifest_path       | `Cargo.toml` | Path to `Cargo.toml`, relative to `path_prefix` or absolute; must not be a symlink    |
-| workspace           | `true`       | Build every workspace member (`--workspace`); a non-empty `packages` replaces it      |
-| packages            | `''`         | Whitespace-separated packages to build (`--package`), in place of `--workspace`       |
-| exclude             | `''`         | Whitespace-separated packages to skip (`--exclude`); needs `workspace`, no `packages` |
-| features            | `''`         | Features to enable, separated by whitespace or commas; `package/feature` allowed      |
-| all_features        | `false`      | Enable all features (`--all-features`)                                                |
-| no_default_features | `false`      | Disable default features (`--no-default-features`)                                    |
-| toolchain           | `''`         | rustup channel to use; empty uses the toolchain that `path_prefix` selects            |
-| lockfile_required   | `false`      | Fail when `Cargo.lock` is missing, instead of generating one                          |
-| setup_script        | `''`         | Script to run with bash before Cargo, relative to `path_prefix`                       |
-| target              | `''`         | Target triple to build for; empty builds for the host                                 |
-| profile             | `release`    | Cargo profile: `dev`, `release` or a custom profile name                              |
-| cargo_args          | `''`         | Extra `cargo build` arguments, split on whitespace and never run by a shell           |
-| binaries            | `false`      | Copy built binaries into `artefact_path` with a `SHA256SUMS` file                     |
-| package_crates      | `false`      | Package publishable crates into `artefact_path/crates` with `crates.json`             |
-| artefact_upload     | `true`       | Upload `artefact_path` as a workflow artefact when it holds files                     |
-| artefact_name       | `''`         | Artefact name; empty uses `rust-build-<target triple>`                                |
-| artefact_path       | `dist`       | Directory for binaries and crates, relative to `path_prefix`; must be empty or new    |
-| summary             | `true`       | Write a job summary                                                                   |
+| Name                 | Default      | Description                                                                           |
+| -------------------- | ------------ | ------------------------------------------------------------------------------------- |
+| path_prefix          | `.`          | Directory holding the project, inside the workspace                                   |
+| manifest_path        | `Cargo.toml` | Path to `Cargo.toml`, relative to `path_prefix` or absolute; must not be a symlink    |
+| workspace            | `true`       | Build every workspace member (`--workspace`); a non-empty `packages` replaces it      |
+| packages             | `''`         | Whitespace-separated packages to build (`--package`), in place of `--workspace`       |
+| exclude              | `''`         | Whitespace-separated packages to skip (`--exclude`); needs `workspace`, no `packages` |
+| features             | `''`         | Features to enable, separated by whitespace or commas; `package/feature` allowed      |
+| all_features         | `false`      | Enable all features (`--all-features`)                                                |
+| no_default_features  | `false`      | Disable default features (`--no-default-features`)                                    |
+| toolchain            | `''`         | rustup channel to use; empty uses the toolchain that `path_prefix` selects            |
+| toolchain_components | `''`         | rustup components to install into the channel, separated by whitespace or commas      |
+| toolchain_targets    | `''`         | Target triples to install into the channel, separated by whitespace or commas         |
+| lockfile_required    | `false`      | Fail when `Cargo.lock` is missing, instead of generating one                          |
+| setup_script         | `''`         | Script to run with bash before Cargo, relative to `path_prefix`                       |
+| target               | `''`         | Target triple to build for; empty builds for the host                                 |
+| profile              | `release`    | Cargo profile: `dev`, `release` or a custom profile name                              |
+| cargo_args           | `''`         | Extra `cargo build` arguments, split on whitespace and never run by a shell           |
+| binaries             | `false`      | Copy built binaries into `artefact_path` with a `SHA256SUMS` file                     |
+| package_crates       | `false`      | Package publishable crates into `artefact_path/crates` with `crates.json`             |
+| artefact_upload      | `true`       | Upload `artefact_path` as a workflow artefact when it holds files                     |
+| artefact_name        | `''`         | Artefact name; empty uses `rust-build-<target triple>`                                |
+| artefact_path        | `dist`       | Directory for binaries and crates, relative to `path_prefix`; must be empty or new    |
+| summary              | `true`       | Write a job summary                                                                   |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -143,14 +145,18 @@ The job summary names the stage that failed.
    every later call. A path-based toolchain runs unpinned from
    `path_prefix`, with a warning. Without rustup, the action uses the
    `cargo` on `PATH` and reports `toolchain_kind` as `none`.
-3. **Run setup script.** Runs `setup_script` with bash from
+3. **Install toolchain.** Installs the channel with any
+   `toolchain_components` and `toolchain_targets`; see
+   [Toolchain components and targets](#toolchain-components-and-targets).
+4. **Run setup script.** Runs `setup_script` with bash from
    `path_prefix`, for example to install the native libraries that
    `-sys` crates need.
-4. **Inspect toolchain.** Records the Cargo and rustc versions and
+5. **Inspect toolchain.** Records the Cargo and rustc versions and
    the host triple.
-5. **Add target.** For a non-host `target` on a channel toolchain,
-   runs `rustup target add`. Other toolchains must already have it.
-6. **Read metadata.** Runs `cargo metadata` and works out the
+6. **Add target.** For a non-host `target` on a channel toolchain,
+   runs `rustup target add`, unless `toolchain_targets` already
+   installed it. Other toolchains must already have it.
+7. **Read metadata.** Runs `cargo metadata` and works out the
    selected packages the same way Cargo does: the named ones, every
    member less exclusions, or with `workspace: false` the default
    members (the manifest's own package, else
@@ -160,21 +166,21 @@ The job summary names the stage that failed.
    `package_crates` on Cargo older than 1.90, the action fails here
    (as "Check packaging") when one crate it would package depends on
    another; see [Notes](#notes).
-7. **Check lockfile.** Without `Cargo.lock`, the action fails when
+8. **Check lockfile.** Without `Cargo.lock`, the action fails when
    `lockfile_required` is `true`. Otherwise it runs
    `cargo generate-lockfile` and warns. Every later Cargo command
    runs with `--locked`.
-8. **Build.** Runs `cargo build` with the selected profile, target,
+9. **Build.** Runs `cargo build` with the selected profile, target,
    packages and features, then `cargo_args`. The action always passes
    `--target`, the host triple included, so `build.target` in Cargo
    configuration cannot build for a target the outputs do not name.
    Cargo then writes to `target/<triple>/<profile>` and, as with any
    explicit `--target`, does not pass `RUSTFLAGS` to build scripts
    and proc macros.
-9. **Package crates.** With `package_crates`, runs `cargo package`
-   for the selected packages that Cargo may publish, skipping those
-   with `publish = false`.
-10. **Collect artefacts.** Copies binaries to the top of
+10. **Package crates.** With `package_crates`, runs `cargo package`
+    for the selected packages that Cargo may publish, skipping those
+    with `publish = false`.
+11. **Collect artefacts.** Copies binaries to the top of
     `artefact_path` with a `SHA256SUMS` file covering them. Copies
     `.crate` files to `artefact_path/crates`, and writes
     `crates.json` at the top of `artefact_path`. Then uploads
@@ -193,6 +199,34 @@ skipped, for example for unmet `required-features`, produces a
 warning. A binary named `SHA256SUMS`, `crates` or `crates.json`, in
 any letter case, fails the build: it would collide with the
 artefact's own files.
+
+### Toolchain components and targets
+
+A `toolchain` input makes rustup ignore the project's
+`rust-toolchain.toml`, and with it the `components` and `targets`
+that file lists. Pass them through `toolchain_components` (such as
+`clippy, rustfmt`) and `toolchain_targets` (such as
+`wasm32-unknown-unknown`). Each name must start with a letter or
+digit, followed by letters, digits, `_`, `.` or `-`.
+
+- On a channel toolchain, with either list set, the action runs one
+  `rustup toolchain install <channel> --profile minimal
+  --no-self-update --component <a,b> --target <x,y>`. It installs a
+  missing toolchain with the minimal profile, or adds the components
+  and targets to the installed one. An exact version such as
+  `1.90.0` or `nightly-2026-10-01` stays as installed; a moving
+  channel such as `stable` updates to its newest release.
+- With `toolchain` set and both lists empty, the action installs that
+  channel the same way when `rustup which` finds it missing, and
+  otherwise leaves the installed one untouched. It does not rely on
+  rustup's auto-install, which installs the `default` profile and
+  which `RUSTUP_AUTO_INSTALL=0` turns off. A toolchain from
+  `rustup toolchain link` works here, though rustup cannot add
+  components or targets to one.
+- On a path toolchain the action ignores both lists, with a warning.
+  Without rustup, either list fails the build.
+
+The job summary lists what the action installed.
 
 ### Security
 

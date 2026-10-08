@@ -6,7 +6,8 @@
 name: "🦀 Rust Build"
 # yamllint disable-line rule:line-length
 description: "Builds a Rust project with Cargo, optionally collecting its binaries and packaging its crates"
-# Stages: validate inputs, resolve the toolchain once, run an optional
+# Stages: validate inputs, resolve the toolchain once and install it
+# with any requested components and targets, run an optional
 # setup script, add the target, read metadata, check the lockfile,
 # 'cargo build', 'cargo package', then gather binaries and crates
 # with checksums into artefact_path and upload them. Holds no
@@ -51,6 +52,16 @@ inputs:
   toolchain:
     # yamllint disable-line rule:line-length
     description: "rustup channel to use; empty uses the one path_prefix selects"
+    required: false
+    default: ""
+  toolchain_components:
+    # yamllint disable-line rule:line-length
+    description: "rustup components to install into the channel, separated by whitespace or commas"
+    required: false
+    default: ""
+  toolchain_targets:
+    # yamllint disable-line rule:line-length
+    description: "Target triples to install into the channel, separated by whitespace or commas"
     required: false
     default: ""
   lockfile_required:
@@ -160,6 +171,8 @@ runs:
         INPUT_ALL_FEATURES: ${{ inputs.all_features }}
         INPUT_NO_DEFAULT_FEATURES: ${{ inputs.no_default_features }}
         INPUT_TOOLCHAIN: ${{ inputs.toolchain }}
+        INPUT_TOOLCHAIN_COMPONENTS: ${{ inputs.toolchain_components }}
+        INPUT_TOOLCHAIN_TARGETS: ${{ inputs.toolchain_targets }}
         INPUT_LOCKFILE_REQUIRED: ${{ inputs.lockfile_required }}
         INPUT_SETUP_SCRIPT: ${{ inputs.setup_script }}
         INPUT_TARGET: ${{ inputs.target }}
