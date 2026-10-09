@@ -651,9 +651,10 @@ case "$toolchain_kind" in
       fi
       echo "Running: rustup ${install_args[*]}"
       if ! in_project rustup "${install_args[@]}"; then
-        if [ -n "$install_cell" ]; then
-          install_cell="❌ rustup could not install them"
+        if [ "${#extras[@]}" -eq 0 ]; then
+          fail "rustup could not install toolchain $toolchain_pin"
         fi
+        install_cell="❌ rustup could not install them"
         fail "rustup could not install toolchain $toolchain_pin with the" \
           "requested toolchain_components and toolchain_targets"
       fi
