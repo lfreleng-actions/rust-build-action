@@ -783,12 +783,18 @@ readonly install_call="toolchain install 1.90.0 --profile minimal --no-self-upda
   grep -q 'Failed at Install toolchain' "$GITHUB_STEP_SUMMARY"
   grep -Fq '| Components and targets | ❌ rustup could not install them |' \
     "$GITHUB_STEP_SUMMARY"
+}
 
-  # A toolchain input alone fails the same way when the install does.
-  export INPUT_TOOLCHAIN_COMPONENTS='' MOCK_MISSING=1.90.0
+@test "names only the toolchain when installing it alone fails" {
+  export INPUT_TOOLCHAIN=1.90.0 MOCK_MISSING=1.90.0 MOCK_FAIL=install
   run_action
+
   [ "$status" -eq 1 ]
+  # No lists were requested, so the message does not name them.
+  [ "$(grep '^::error' <<< "$output")" \
+    = '::error title=rust-build::rustup could not install toolchain 1.90.0' ]
   grep -q 'Failed at Install toolchain' "$GITHUB_STEP_SUMMARY"
+  run ! grep -q 'Components and targets' "$GITHUB_STEP_SUMMARY"
   [ ! -s "$MOCK_CARGO_LOG" ]
 }
 
