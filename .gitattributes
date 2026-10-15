@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# The shared version-stamp vectors keep their CRLF line endings.
+tests/fixtures/version-stamp-crlf/** -text

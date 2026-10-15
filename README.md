@@ -102,6 +102,7 @@ and nothing else.
 | target                  | `''`         | Target triple to build for; empty builds for the host                                  |
 | profile                 | `release`    | Cargo profile: `dev`, `release` or a custom profile name                               |
 | cargo_args              | `''`         | Extra `cargo build` arguments, split on whitespace and never run by a shell            |
+| version                 | `''`         | Release version to set in place of the `0.0.0` placeholder; empty changes nothing      |
 | binaries                | `false`      | Copy built binaries into `artefact_path` with a `SHA256SUMS` file                      |
 | auditable               | `false`      | Build binaries with `cargo auditable`, embedding the dependency list; needs `binaries` |
 | cargo_auditable_version | `0.7.7`      | `cargo-auditable` release to install when `auditable` is `true`                        |
@@ -158,18 +159,22 @@ at Check inputs.
 3. **Install toolchain.** Installs the channel with any
    `toolchain_components` and `toolchain_targets`; see
    [Toolchain components and targets](#toolchain-components-and-targets).
-4. **Run setup script.** Runs `setup_script` with bash from
+4. **Stamp version.** With `version` set, checks that every workspace
+   member carries the placeholder `0.0.0`, then sets `version` in
+   the manifests and `Cargo.lock`; see
+   [Tag-based versioning](#tag-based-versioning).
+5. **Run setup script.** Runs `setup_script` with bash from
    `path_prefix`, for example to install the native libraries that
    `-sys` crates need.
-5. **Inspect toolchain.** Records the Cargo and rustc versions and
+6. **Inspect toolchain.** Records the Cargo and rustc versions and
    the host triple.
-6. **Check cargo-auditable.** With `auditable` and `binaries`, checks
+7. **Check cargo-auditable.** With `auditable` and `binaries`, checks
    that Cargo finds the `cargo-auditable` the action installed; see
    [Auditable binaries](#auditable-binaries).
-7. **Add target.** For a non-host `target` on a channel toolchain,
+8. **Add target.** For a non-host `target` on a channel toolchain,
    runs `rustup target add`, unless `toolchain_targets` already
    installed it. Other toolchains must already have it.
-8. **Read metadata.** Runs `cargo metadata` and works out the
+9. **Read metadata.** Runs `cargo metadata` and works out the
    selected packages the same way Cargo does: the named ones, every
    member less exclusions, or with `workspace: false` the default
    members (the manifest's own package, else
@@ -179,11 +184,11 @@ at Check inputs.
    `package_crates` on Cargo older than 1.90, the action fails here
    (as "Check packaging") when one crate it would package depends on
    another; see [Notes](#notes).
-9. **Check lockfile.** Without `Cargo.lock`, the action fails when
-   `lockfile_required` is `true`. Otherwise it runs
-   `cargo generate-lockfile` and warns. Every later Cargo command
-   runs with `--locked`.
-10. **Build.** Runs `cargo build`, or `cargo auditable build` with
+10. **Check lockfile.** Without `Cargo.lock`, the action fails when
+    `lockfile_required` is `true`. Otherwise it runs
+    `cargo generate-lockfile` and warns. Every later Cargo command
+    runs with `--locked`.
+11. **Build.** Runs `cargo build`, or `cargo auditable build` with
     `auditable` and `binaries`, with the selected profile, target,
     packages and features, then `cargo_args`. The action always passes
     `--target`, the host triple included, so `build.target` in Cargo
@@ -191,10 +196,10 @@ at Check inputs.
     Cargo then writes to `target/<triple>/<profile>` and, as with any
     explicit `--target`, does not pass `RUSTFLAGS` to build scripts
     and proc macros.
-11. **Package crates.** With `package_crates`, runs `cargo package`
+12. **Package crates.** With `package_crates`, runs `cargo package`
     for the selected packages that Cargo may publish, skipping those
     with `publish = false`.
-12. **Collect artefacts.** Copies binaries to the top of
+13. **Collect artefacts.** Copies binaries to the top of
     `artefact_path` with a `SHA256SUMS` file covering them. Copies
     `.crate` files to `artefact_path/crates`, and writes
     `crates.json` at the top of `artefact_path`. Then uploads
@@ -213,6 +218,83 @@ skipped, for example for unmet `required-features`, produces a
 warning. A binary named `SHA256SUMS`, `crates` or `crates.json`, in
 any letter case, fails the build: it would collide with the
 artefact's own files.
+
+### Tag-based versioning
+
+A project can take its release version from a git tag instead of
+`Cargo.toml`. Every workspace member then keeps the placeholder
+version `0.0.0` in `Cargo.toml`, and the release workflow passes the
+tag's version without its leading `v` (`v1.2.3` becomes `1.2.3`) as
+`version`. An empty `version` leaves the checkout alone, so projects
+that keep their version in `Cargo.toml` build as before; the action
+supports both.
+
+With `version` set, the Stamp version stage:
+
+1. Reads `cargo metadata --no-deps` and fails unless every workspace
+   member carries `0.0.0`, naming the first that does not. The check
+   covers every member, whatever `workspace`, `packages` and
+   `exclude` select.
+2. Replaces the placeholder, as text, in the workspace root manifest,
+   each member's manifest and `Cargo.lock`, each of which must be a
+   regular file, not a symlink, below the Cargo workspace root, where
+   the checks before packaging look. In a manifest, it changes
+   a quoted `0.0.0`, with an optional `=`, `^` or `~`, that a
+   `version` key holds: the `[package]` and `[workspace.package]`
+   versions, and requirements such as
+   `core = { path = "../core", version = "=0.0.0" }`.
+   `rust-version`, `version.workspace = true` and every other byte
+   stay as they are. In `Cargo.lock`, it changes each member's own
+   version and `"<member> 0.0.0"` dependency entries, within
+   `[[package]]` tables; third-party packages, `0.0.0` included, and
+   other tables such as `[[patch.unused]]` keep their versions. The
+   rewrite reads each line without its ending and writes every line
+   ending back unchanged, so a Windows checkout keeps its CRLF
+   endings, and a file without a final newline stays that way.
+3. Runs `cargo metadata` again and fails unless every member now
+   reports `version`.
+
+This happens before `setup_script`, lockfile generation and the
+build, so every compile sees the release version: binaries embed it
+through `CARGO_PKG_VERSION`, as `--version` output shows, and
+`crates_json` and the `.crate` file names carry it. A dependency on
+a crate outside the workspace pinned to `0.0.0` changes too, and
+then fails the `--locked` build rather than passing unnoticed.
+
+Cargo refuses to package a tree with uncommitted changes, and the
+rewrite makes some. With `package_crates`, the action passes
+`--allow-dirty` to `cargo package`, which also hides any other
+change, so it checks the tree itself. Before the rewrite, `git
+status` over the workspace root must show nothing but an untracked
+`Cargo.lock`, so no file the rewrite covers holds an edit of its
+own. The action keeps a copy of each rewritten file, and of a
+`Cargo.lock` this run generates. Before packaging, each of those
+files must still equal its copy, and `git status` must show nothing
+else: an edit `setup_script` or a build script makes, to a rewritten
+file or any other, an untracked file included, fails the build, and
+the log lists it. A run without `version` never passes
+`--allow-dirty`. Outside a git repository Cargo checks nothing, and
+the action passes no flag.
+
+The rust-workflows release lane passes the same `version` to
+[rust-crate-publish-action](https://github.com/lfreleng-actions/rust-crate-publish-action),
+which rewrites the checkout the same way, byte for byte. The `.crate`
+files this action packages then match the ones the publisher
+verifies and uploads; the lane compares their SHA-256 digests.
+
+Known limitation: the manifest rewrite works line by line and does
+not parse TOML. A literal (single-quoted) or multi-line string that
+holds the text `version = "0.0.0"` after whitespace, `{` or `,`
+changes too. rust-crate-publish-action rewrites it the same way, so
+the packaged crates still match, and the placeholder check and the
+`cargo metadata` check after the rewrite still hold. Keep such text
+out of tag-versioned manifests.
+
+Provenance: a stamped build comes from a modified checkout. The
+tagged commit's `Cargo.toml` holds `0.0.0`, not the version that the
+binaries and crates carry, so build provenance that names the commit
+describes the source before the rewrite. The job summary records the
+version and where it came from.
 
 ### Toolchain components and targets
 
@@ -339,7 +421,9 @@ or `Cargo.lock`.
 - In a git repository, `cargo package` refuses untracked or modified
   files in a package directory. Commit or ignore them, including any
   that `setup_script` writes there. A `Cargo.lock` that the action
-  generates does not count.
+  generates does not count. With `version` set, any change under the
+  workspace root besides the rewrite fails packaging; see
+  [Tag-based versioning](#tag-based-versioning).
 - With `binaries` and `package_crates` both `false`, `artefact_path`
   stays empty and the action uploads nothing.
 

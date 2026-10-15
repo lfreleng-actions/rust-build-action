@@ -1,0 +1,10 @@
+version = 4
+
+[[package]]
+name = "demo-a"
+version = "0.0.0"
+dependencies = ["demo-b 0.0.0", "demo-b-extra 0.0.0"]
+
+[[package]]
+name = "demo-b"
+version = "0.0.0"

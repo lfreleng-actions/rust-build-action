@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+version = 1
+
+# The shared version-stamp test vectors must stay byte-identical to the
+# copy in rust-crate-publish-action, so they carry no headers.
+[[annotations]]
+path = [
+  "tests/fixtures/version-stamp/**",
+  "tests/fixtures/version-stamp-crlf/**",
+  "tests/fixtures/version-stamp-inline/**",
+]
+SPDX-FileCopyrightText = "2026 The Linux Foundation"
+SPDX-License-Identifier = "Apache-2.0"

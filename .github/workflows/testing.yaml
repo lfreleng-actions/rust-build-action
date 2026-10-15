@@ -586,6 +586,154 @@ jobs:
             exit 1
           fi
 
+  tag-versioned-fixture:
+    name: "Build tag-versioned workspace"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5  # v0.13.1
+        with:
+          config: '@538904e241556d101fb908b50e2a2965fa0346cf'  # v0.16.6
+
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25  # v2.22.1
+        with:
+          egress-policy: "block"
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Members at the placeholder 0.0.0: 'lib' (library, its own
+      # version) and 'cli' (binary printing CARGO_PKG_VERSION for
+      # --version, inheriting the workspace version, depending on 'lib'
+      # by path and "=0.0.0"), committed with Cargo.lock in their own
+      # git repository.
+      - name: "Generate tag-versioned fixture"
+        id: fixture
+        shell: bash
+        run: |
+          # Generate tag-versioned fixture
+          set -euo pipefail
+          random="$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n')"
+          base="lfreleng-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$random"
+          root=fixtures/tagged
+          mkdir -p "$root/lib/src" "$root/cli/src"
+          cd "$root"
+          printf '%s\n' '[workspace]' 'resolver = "2"' \
+            'members = ["lib", "cli"]' '' '[workspace.package]' \
+            'version = "0.0.0"' 'edition = "2021"' \
+            'description = "lfreleng-actions CI fixture"' \
+            'license = "Apache-2.0"' > Cargo.toml
+          printf '/target\n' > .gitignore
+          printf '%s\n' '[package]' "name = \"$base-lib\"" \
+            'version = "0.0.0"' 'edition.workspace = true' \
+            'description.workspace = true' 'license.workspace = true' \
+            > lib/Cargo.toml
+          printf 'pub fn value() -> u32 {\n    42\n}\n' > lib/src/lib.rs
+          printf '%s\n' '[package]' "name = \"$base-cli\"" \
+            'version.workspace = true' 'edition.workspace = true' \
+            'description.workspace = true' 'license.workspace = true' '' \
+            '[dependencies]' > cli/Cargo.toml
+          dependency="package = \"$base-lib\", path = \"../lib\""
+          printf 'lib = { %s, version = "=0.0.0" }\n' "$dependency" \
+            >> cli/Cargo.toml
+          cat > cli/src/main.rs << 'EOF'
+          fn main() {
+              if std::env::args().nth(1).as_deref() == Some("--version") {
+                  println!("{}", env!("CARGO_PKG_VERSION"));
+              } else {
+                  println!("{}", lib::value());
+              }
+          }
+          EOF
+          cargo generate-lockfile
+          git init -q -b main
+          git add -A
+          git -c user.name=CI -c user.email=ci@example.invalid \
+            -c commit.gpgsign=false commit -q -m "Fixture"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+
+      - name: "Running local action: version"
+        id: build
+        uses: $/
+        with:
+          path_prefix: fixtures/tagged
+          toolchain: stable
+          version: "1.2.3-rc.1+build.5"
+          binaries: "true"
+          package_crates: "true"
+          artefact_upload: "false"
+          artefact_path: out/dist
+
+      - name: "Check the stamped binary, crates and checkout"
+        shell: bash
+        env:
+          BASE: ${{ steps.fixture.outputs.base }}
+          ARTEFACT_PATH: ${{ steps.build.outputs.artefact_path }}
+          CRATES_JSON: ${{ steps.build.outputs.crates_json }}
+        run: |
+          # Check the stamped binary, crates and checkout
+          set -euo pipefail
+          version="1.2.3-rc.1+build.5"
+          jq -e --arg b "$BASE" --arg v "$version" '
+            [.[] | [.name, .version, .file]] | sort == [
+              ["\($b)-cli", $v, "crates/\($b)-cli-\($v).crate"],
+              ["\($b)-lib", $v, "crates/\($b)-lib-\($v).crate"]]' \
+            <<< "$CRATES_JSON"
+          [ "$("$ARTEFACT_PATH/$BASE-cli" --version)" = "$version" ]
+          [ "$("$ARTEFACT_PATH/$BASE-cli")" = 42 ]
+          # Only the rewritten files changed; the artefact is ignored
+          # here, as it reached the tree after packaging.
+          [ "$(git -C fixtures/tagged status --porcelain -- . ':!out')" \
+            = "$(printf ' M %s\n' Cargo.lock Cargo.toml cli/Cargo.toml \
+              lib/Cargo.toml)" ]
+          crate="$ARTEFACT_PATH/crates/$BASE-lib-$version.crate"
+          tar -xzOf "$crate" "$BASE-lib-$version/Cargo.toml" \
+            | grep -Fx "version = \"$version\""
+
+      # Back at the committed placeholder, without the first run's
+      # artefacts, an untracked file besides the rewrite must stop
+      # packaging.
+      - name: "Add an unrelated untracked file"
+        shell: bash
+        run: |
+          # Add an unrelated untracked file
+          set -euo pipefail
+          git -C fixtures/tagged checkout -q -- .
+          rm -rf fixtures/tagged/out
+          [ -z "$(git -C fixtures/tagged status --porcelain)" ]
+          echo stray > fixtures/tagged/lib/stray.txt
+
+      - name: "Running local action: version with a dirty tree"
+        id: dirty
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: fixtures/tagged
+          toolchain: stable
+          version: "1.2.3"
+          package_crates: "true"
+          artefact_upload: "false"
+          artefact_path: out/dirty
+
+      - name: "Check that packaging refused the dirty tree"
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.dirty.outcome }}
+        run: |
+          # Check that packaging refused the dirty tree
+          set -euo pipefail
+          [ "$OUTCOME" = failure ]
+          [ ! -e fixtures/tagged/out/dirty/crates ]
+
   ### Failure paths: each step must fail ###
   failure-paths:
     name: "Failure paths"
