@@ -76,14 +76,44 @@ metadata() {
 }
 
 # Tests that need altered metadata name a jq filter file, applied to
-# the document above.
+# the document above. MOCK_FILE_VERSIONS=true then reads each package's
+# version from its manifest on disk, falling back to the root
+# manifest's for 'version.workspace = true', as Cargo would report a
+# version rewrite.
 metadata_document() {
+  local doc manifest
   if [ -n "${MOCK_METADATA_FILTER_FILE:-}" ]; then
-    metadata "$1" | jq -f "$MOCK_METADATA_FILTER_FILE"
+    doc="$(metadata "$1" | jq -f "$MOCK_METADATA_FILTER_FILE")"
   else
-    metadata "$1"
+    doc="$(metadata "$1")"
   fi
+  if [ "${MOCK_FILE_VERSIONS:-false}" = "true" ]; then
+    while IFS= read -r -d '' manifest; do
+      doc="$(jq --arg m "$manifest" --arg v "$(file_version "$manifest")" \
+        '(.packages[] | select(.manifest_path == $m) | .version) = $v' <<< "$doc")"
+    done < <(jq -j '.packages[].manifest_path + "\u0000"' <<< "$doc")
+  fi
+  printf '%s\n' "$doc"
 }
+
+# The version a [package] or [workspace.package] table sets with a
+# quoted string, else the root manifest's, for 'version.workspace'.
+file_version() {
+  local version expression
+  expression="/^\\[(workspace\\.)?package\\]/,/^\\[/s/^version[[:space:]]*=[[:space:]]*[\"']([^\"']*)[\"'].*/\\1/p"
+  version="$(sed -nE "$expression" "$1" | head -1)"
+  if [ -z "$version" ]; then
+    version="$(sed -nE "$expression" "$root/Cargo.toml" | head -1)"
+  fi
+  printf '%s' "$version"
+}
+
+# With MOCK_FILE_VERSIONS, log the root manifest's version each call
+# saw, so that tests can tell which calls ran before the rewrite.
+if [ "${MOCK_FILE_VERSIONS:-false}" = "true" ]; then
+  printf 'saw: %s %s\n' "${1:-}" "$(file_version "$root/Cargo.toml")" \
+    >> "$MOCK_CARGO_LOG"
+fi
 
 # Option values from the argument list: '--name=value' forms only, as
 # rust-build.sh passes them.
@@ -163,6 +193,10 @@ case "${1:-}" in
     esac
     out_dir="$target_dir/${triple:+$triple/}$profile_dir"
     mkdir -p "$out_dir/deps" "$out_dir/build"
+    # Stands in for a build script that edits a checkout file.
+    if [ -n "${MOCK_BUILD_APPEND:-}" ]; then
+      printf '# edited\n' >> "$MOCK_BUILD_APPEND"
+    fi
     echo "this line is not JSON"
     while IFS= read -r package; do
       jq -c --arg out "$out_dir" --arg skip " ${MOCK_SKIP_BINS:-} " '

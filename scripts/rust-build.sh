@@ -9,7 +9,8 @@
 # The stages run in this order, and the first failure ends the run:
 #
 #   Check inputs -> Resolve toolchain -> Install toolchain
-#   -> Run setup script -> Inspect toolchain -> Check cargo-auditable
+#   -> Stamp version -> Run setup script -> Inspect toolchain
+#   -> Check cargo-auditable
 #   -> Add target -> Read metadata
 #   -> Check lockfile -> Build -> Package crates -> Collect artefacts
 #
@@ -51,6 +52,7 @@ artefact_upload="${INPUT_ARTEFACT_UPLOAD-true}"
 artefact_name="${INPUT_ARTEFACT_NAME-}"
 artefact_path="${INPUT_ARTEFACT_PATH-dist}"
 summary="${INPUT_SUMMARY-true}"
+version_input="${INPUT_VERSION-}"
 
 readonly name_pattern='^[A-Za-z0-9_][A-Za-z0-9_-]*$'
 readonly feature_pattern='^([A-Za-z0-9_][A-Za-z0-9_-]*/)?[A-Za-z0-9_][A-Za-z0-9_+.-]*$'
@@ -60,6 +62,10 @@ readonly triple_pattern='^[a-z0-9_.]+(-[a-z0-9_.]+){1,4}$'
 readonly profile_pattern='^[A-Za-z][A-Za-z0-9_-]{0,63}$'
 readonly artefact_name_pattern='^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$'
 readonly version_pattern='^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$'
+# The version input: SemVer 2.0 without a leading 'v' (a numeric
+# pre-release identifier has no leading zero), exactly as the tag-based
+# versioning spec shared with rust-crate-publish-action reads.
+readonly semver_pattern='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
 readonly msrv_pattern='^[0-9]+(\.[0-9]+){0,2}$'
 readonly sha256_pattern='^[0-9a-f]{64}$'
 # Every reason rustup appends to a toolchain name, before 1.28 and
@@ -76,6 +82,21 @@ cargo_version=""
 rustc_version=""
 resolved_target=""
 manifest_display=""
+# Set only when the version input is set, once it is validated.
+version_cell=""
+# The files the version rewrite changed.
+stamped_files=()
+# Every file the version rewrite covered, a Cargo.lock this run
+# generated included, each with a copy in the work directory taken
+# right after the rewrite (or the generation): packaging accepts these
+# files changed, but only to exactly that content, and with the same
+# executable bit ('x' or '-' in stamp_kept_exec), which Cargo records
+# in the .crate.
+stamp_kept=()
+stamp_kept_exec=()
+# The git work tree holding the workspace, when packaging a stamped
+# tree needs --allow-dirty; empty otherwise.
+stamp_git_top=""
 # Set only when auditable is 'true'.
 auditable_cell=""
 # Set only when toolchain_components or toolchain_targets name any.
@@ -295,6 +316,266 @@ json_strings() {
   jq -nc '$ARGS.positional' --args "$@"
 }
 
+# Tag-based versioning keeps the placeholder 0.0.0 in every manifest;
+# these set the version input in its place, as text, byte for byte the
+# way rust-crate-publish-action does, so that both package identical
+# crates. Each rewrites one file in place, keeping its inode and mode,
+# and records it in 'stamped_files' when anything changed.
+#
+# Both rules read a file as lines and match each line's content without
+# its ending, CRLF or LF, so that anchors work on files a Windows
+# checkout converted; every line is written back with exactly its own
+# ending, and a final line without a newline stays without one. This
+# prefix sets 'ending' and strips it from $0. awk numbers that final
+# line 'open_nr'; it is 0 when the file ends with a newline.
+# shellcheck disable=SC2016 # awk, not shell, expands these
+readonly stamp_awk_lines='
+{
+  ending = "\n"
+  if (NR == open_nr) ending = ""
+  else if (sub(/\r$/, "")) ending = "\r\n"
+}'
+
+# A manifest: every quoted 0.0.0 a 'version' key holds, with an
+# optional = ^ or ~ operator; [package], [workspace.package] and
+# dependency versions alike. On each line, every match of
+#   (^|[[:space:]{,])(version[[:space:]]*=[[:space:]]*"(=|\^|~)?)0\.0\.0"
+# becomes \1\2<version>". A leading space stands in for '^', so one
+# expression serves every match; it is dropped again on output.
+# shellcheck disable=SC2016 # awk, not shell, expands these
+readonly stamp_manifest_awk='
+{
+  rest = " " $0
+  out = ""
+  while (match(rest, /[[:space:]{,]version[[:space:]]*=[[:space:]]*"[=^~]?0\.0\.0"/)) {
+    out = out substr(rest, 1, RSTART + RLENGTH - 7) version "\""
+    rest = substr(rest, RSTART + RLENGTH)
+  }
+  printf "%s%s", substr(out rest, 2), ending
+}'
+
+# Cargo.lock: a section starts at each line that begins with '[', and
+# only [[package]] sections change, so a trailing [[patch.unused]] or
+# [metadata] table cannot pass for a package. In them: the version
+# line of each workspace member's own package (its first name line
+# names a member, and it has no source line), and on every line each
+# "<member> 0.0.0" entry, whether the dependencies array spans lines
+# or sits on one. Third-party packages keep their versions, 0.0.0
+# included. 'members' lists the members, separated by spaces.
+# shellcheck disable=SC2016 # awk, not shell, expands these
+readonly stamp_lockfile_awk='
+BEGIN {
+  count = split(members, list, " ")
+  for (i = 1; i <= count; i++) member[list[i]] = 1
+}
+function entries(line,   i, from, to, out, at) {
+  for (i = 1; i <= count; i++) {
+    from = "\"" list[i] " 0.0.0\""
+    to = "\"" list[i] " " version "\""
+    out = ""
+    while ((at = index(line, from)) > 0) {
+      out = out substr(line, 1, at - 1) to
+      line = substr(line, at + length(from))
+    }
+    line = out line
+  }
+  return line
+}
+function flush(   i, own) {
+  own = named && (name in member) && !sourced
+  for (i = 1; i <= held; i++) {
+    if (own && buf[i] == "version = \"0.0.0\"")
+      buf[i] = "version = \"" version "\""
+    printf "%s%s", buf[i], ends[i]
+  }
+  held = 0; named = 0; sourced = 0
+}
+/^\[/ { flush(); is_package = ($0 == "[[package]]") }
+{
+  line = $0
+  if (is_package) {
+    if (!named && line ~ /^name = "[^"]*"$/) {
+      name = substr(line, 9, length(line) - 9)
+      named = 1
+    }
+    if (substr(line, 1, 9) == "source = ") sourced = 1
+    line = entries(line)
+  }
+  buf[++held] = line
+  ends[held] = ending
+}
+END { flush() }'
+
+# Rewrite FILE with the awk PROGRAM, passing any further arguments to
+# awk, in the C locale so that [[:space:]] means the same bytes on
+# every runner.
+stamp_rewrite() {
+  local file="$1" program="$2" open_nr=0
+  shift 2
+  # Command substitution strips a newline, so this is empty when the
+  # file ends with one.
+  if [ -n "$(tail -c 1 < "$file")" ]; then
+    open_nr=$(($(wc -l < "$file") + 1))
+  fi
+  if ! LC_ALL=C awk -v version="$version_input" -v open_nr="$open_nr" \
+    "$@" "$stamp_awk_lines$program" < "$file" > "$work_dir/stamped"; then
+    fail "version is set, but the rewrite of a file failed"
+  fi
+  replace_if_changed "$file"
+}
+
+replace_if_changed() {
+  if ! cmp -s "$work_dir/stamped" "$1"; then
+    cat "$work_dir/stamped" > "$1"
+    stamped_files+=("$1")
+  fi
+}
+
+# Keep a copy of a file the version rewrite covered, as it stands now.
+stamp_keep() {
+  if ! cp -- "$1" "$work_dir/stamp-kept.${#stamp_kept[@]}"; then
+    fail "could not keep a copy of the version rewrite"
+  fi
+  stamp_kept+=("$1")
+  if [ -x "$1" ]; then
+    stamp_kept_exec+=(x)
+  else
+    stamp_kept_exec+=(-)
+  fi
+}
+
+# Find the git work tree holding the workspace root, if any, into
+# stamp_git_top. Outside one, Cargo checks nothing and packaging needs
+# no --allow-dirty.
+stamp_find_git() {
+  local top
+  if ! command -v git > /dev/null 2>&1 \
+    || ! top="$(in_project git -c core.fsmonitor=false \
+      -C "$stamp_root" rev-parse --show-toplevel 2> /dev/null \
+      && echo x)"; then
+    echo "Not in a git checkout: packaging without --allow-dirty"
+    return 0
+  fi
+  if ! canonical_dir "${top%$'\n'x}"; then
+    fail "git reported a repository root that is not a directory"
+  fi
+  case "$stamp_root/" in
+    "$canonical"/*) stamp_git_top="$canonical" ;;
+    *) fail "git reported a repository root outside the Cargo workspace root" ;;
+  esac
+}
+
+# Fail unless git reports nothing under the workspace root beyond what
+# PHASE allows. Before the rewrite ('before'): an untracked Cargo.lock
+# alone, so that no file it covers holds an edit of its own. Before
+# packaging ('after'): only a change to a file stamp_kept lists, whose
+# content stamp_check_kept has already compared with its copy; an
+# untracked Cargo.lock passes only that way, so one setup_script
+# created, which no copy vouches for, does not.
+# Anything else is a change Cargo would refuse to package, which
+# --allow-dirty would let through.
+stamp_check_tree() {
+  local phase="$1" status_file="$work_dir/git-status" entry code path
+  local word listed others=0 lock="$stamp_root/Cargo.lock"
+  # Whole paths, compared whole: a path may hold a newline.
+  local -a allowed=()
+  lock="${lock#"$stamp_git_top"/}"
+  if [ "$phase" = "after" ]; then
+    for word in ${stamp_kept[@]+"${stamp_kept[@]}"}; do
+      allowed+=("${word#"$stamp_git_top"/}")
+    done
+  fi
+  if ! in_project git -c core.fsmonitor=false -C "$stamp_root" \
+    status --porcelain=v1 -z --untracked-files=all --no-renames \
+    -- . > "$status_file"; then
+    fail "git status failed in the workspace root"
+  fi
+  while IFS= read -r -d '' entry; do
+    code="${entry:0:2}"
+    path="${entry:3}"
+    if [ "$phase" = "before" ] && [ "$code" = "??" ] \
+      && [ "$path" = "$lock" ]; then
+      continue
+    fi
+    listed=false
+    for word in ${allowed[@]+"${allowed[@]}"}; do
+      if [ "$word" = "$path" ]; then
+        listed=true
+      fi
+    done
+    if [ "$listed" = "true" ]; then
+      case "$code" in
+        " M" | "M " | "MM" | "??") continue ;;
+      esac
+    fi
+    others=$((others + 1))
+    printf 'Uncommitted change besides the version rewrite: %q\n' "$path"
+  done < "$status_file"
+  if [ "$others" -eq 0 ]; then
+    return 0
+  fi
+  if [ "$phase" = "before" ]; then
+    fail "version is set and package_crates is 'true', but $others" \
+      "path(s) under the workspace root have uncommitted changes before" \
+      "the version rewrite; the step log lists them. Packaging the" \
+      "rewrite needs --allow-dirty, which would let them through"
+  fi
+  crates_cell="❌ Uncommitted changes"
+  fail "package_crates needs --allow-dirty to package the version" \
+    "rewrite, but $others other path(s) under the workspace root" \
+    "have uncommitted changes; the step log lists them"
+}
+
+# Fail unless every file stamp_kept lists is still a regular file
+# holding the content and executable bit it had right after the
+# version rewrite: --allow-dirty would hide an edit the setup script
+# or a build made to one.
+stamp_check_kept() {
+  local i exec_bit
+  for i in "${!stamp_kept[@]}"; do
+    exec_bit=-
+    if [ -x "${stamp_kept[i]}" ]; then
+      exec_bit=x
+    fi
+    if [ -L "${stamp_kept[i]}" ] || [ ! -f "${stamp_kept[i]}" ] \
+      || [ "$exec_bit" != "${stamp_kept_exec[i]}" ] \
+      || ! cmp -s -- "$work_dir/stamp-kept.$i" "${stamp_kept[i]}"; then
+      crates_cell="❌ Changed after the version rewrite"
+      fail "$(printf '%q' "${stamp_kept[i]#"$workspace_real"/}") changed" \
+        "after the version rewrite"
+    fi
+  done
+}
+
+# Fail when Cargo.lock exists but stamp_kept does not list it: the
+# setup script or a build created it, and git may ignore it, so
+# neither check above would see an edit to it.
+stamp_check_lock() {
+  local word
+  if [ ! -e "$stamp_root/Cargo.lock" ] && [ ! -L "$stamp_root/Cargo.lock" ]; then
+    return 0
+  fi
+  for word in ${stamp_kept[@]+"${stamp_kept[@]}"}; do
+    if [ "$word" = "$stamp_root/Cargo.lock" ]; then
+      return 0
+    fi
+  done
+  crates_cell="❌ Changed after the version rewrite"
+  fail "Cargo.lock appeared after the version rewrite; packaging it" \
+    "needs --allow-dirty, which would let it through unchecked"
+}
+
+# Resolve an absolute path the version rewrite may change: a regular
+# file, not a symlink, whose canonical location lies inside the
+# workspace. Sets 'resolved' to its canonical path.
+resolve_stamp_target() {
+  if [ ! -f "$1" ] || [ -L "$1" ] || ! canonical_dir "${1%/*}/" \
+    || ! in_workspace "$canonical"; then
+    fail "version is set, but $2 is not a regular file inside the workspace"
+  fi
+  resolved="$canonical/${1##*/}"
+}
+
 # Name the option a cargo_args word sets when this action owns it.
 # Cargo accepts clustered short flags ('-vr' is '-v -r'), so a
 # single-dash word is read letter by letter up to the first flag that
@@ -353,6 +634,9 @@ finish() {
     fi
     if [ -n "$manifest_display" ]; then
       add_check "Manifest" "$(md_code "$manifest_display")"
+    fi
+    if [ -n "$version_cell" ]; then
+      add_check "Version" "$version_cell"
     fi
     case "$toolchain_kind" in
       channel) add_check "Toolchain" \
@@ -426,6 +710,13 @@ fi
 if [[ ! "$cargo_auditable_version" =~ $version_pattern ]]; then
   fail "cargo_auditable_version must be a release version such as 0.7.7"
 fi
+if [ -n "$version_input" ]; then
+  if [[ ! "$version_input" =~ $semver_pattern ]]; then
+    fail "version must be a SemVer 2.0 version without a leading 'v'" \
+      "(such as 1.2.3 or 1.2.3-rc.1), or empty"
+  fi
+  version_cell="⏸️ Not reached"
+fi
 if [ "$auditable" = "true" ]; then
   if [ "$binaries" = "true" ]; then
     auditable_cell="⏸️ Not reached"
@@ -488,6 +779,9 @@ for tool in cargo jq mktemp wc awk; do
     fail "required tool not found on PATH: $tool"
   fi
 done
+if [ -n "$version_input" ] && ! command -v cmp > /dev/null 2>&1; then
+  fail "required tool not found on PATH: cmp"
+fi
 if ! command -v sha256sum > /dev/null 2>&1 \
   && ! command -v shasum > /dev/null 2>&1; then
   fail "required tool not found on PATH: sha256sum or shasum"
@@ -681,6 +975,112 @@ case "$toolchain_kind" in
     fi
     ;;
 esac
+
+### Stamp version ###
+
+# Tag-based versioning: every workspace member carries the placeholder
+# 0.0.0, and the release version arrives as the version input. It goes
+# into the manifests and Cargo.lock before the setup script, lockfile
+# generation and every compile, so binaries embed it through
+# CARGO_PKG_VERSION and packaged crates carry it. The guard reads
+# metadata as the 'Read metadata' stage does; the rewrite itself is
+# text processing here, running no cargo and no project code.
+if [ -n "$version_input" ]; then
+  stage="Stamp version"
+  version_cell="❌ Failed"
+  stamp_metadata="$work_dir/stamp-metadata.json"
+  in_project cargo metadata --no-deps --format-version 1 --locked \
+    --manifest-path "$manifest_abs" > "$stamp_metadata"
+  stamp_root="$(jq -er '.workspace_root | strings | . + "/"' "$stamp_metadata")"
+  if ! canonical_dir "$stamp_root" || ! in_workspace "$canonical"; then
+    fail "the Cargo workspace root must lie inside the workspace"
+  fi
+  stamp_root="$canonical"
+  members_doc="$work_dir/stamp-members.json"
+  jq -c '.workspace_members as $ids
+    | [.packages[] | select(.id | IN($ids[]))
+       | {name, version, manifest_path}]' "$stamp_metadata" > "$members_doc"
+  if ! jq -e --arg re "$name_pattern" 'length > 0 and all(.[];
+      (.name | strings | test($re))
+      and (.version | strings | test("^[0-9A-Za-z.+-]+$"))
+      and (.manifest_path | strings | startswith("/")))' \
+    "$members_doc" > /dev/null; then
+    fail "cargo metadata reported an unexpected package name, version or" \
+      "manifest path"
+  fi
+  offender="$(jq -r '[.[] | select(.version != "0.0.0")][0]
+    | if . == null then empty else "\(.name) carries \(.version)" end' \
+    "$members_doc")"
+  if [ -n "$offender" ]; then
+    fail "version is set, so every workspace member must carry the" \
+      "placeholder version 0.0.0 in Cargo.toml; $offender"
+  fi
+
+  # The root manifest and each member's, once each, then Cargo.lock.
+  stamp_targets=()
+  resolve_stamp_target "$stamp_root/Cargo.toml" "the workspace manifest"
+  stamp_targets+=("$resolved")
+  while IFS= read -r -d '' word; do
+    resolve_stamp_target "$word" "a workspace member's manifest"
+    # The dirty-tree checks cover the workspace root alone.
+    case "$resolved" in
+      "$stamp_root"/*) ;;
+      *)
+        fail "version is set, but a workspace member's manifest lies" \
+          "outside the Cargo workspace root"
+        ;;
+    esac
+    duplicate=false
+    for seen in "${stamp_targets[@]}"; do
+      if [ "$seen" = "$resolved" ]; then
+        duplicate=true
+      fi
+    done
+    if [ "$duplicate" = "false" ]; then
+      stamp_targets+=("$resolved")
+    fi
+  done < <(jq -j '.[] | .manifest_path + "\u0000"' "$members_doc")
+  stamp_lock=""
+  if [ -e "$stamp_root/Cargo.lock" ] || [ -L "$stamp_root/Cargo.lock" ]; then
+    resolve_stamp_target "$stamp_root/Cargo.lock" "Cargo.lock"
+    stamp_lock="$resolved"
+  fi
+
+  # Packaging the rewrite needs --allow-dirty in a git checkout, so the
+  # files it covers must hold no edit of their own beforehand.
+  if [ "$package_crates" = "true" ]; then
+    stamp_find_git
+    if [ -n "$stamp_git_top" ]; then
+      stamp_check_tree before
+    fi
+  fi
+
+  for word in "${stamp_targets[@]}"; do
+    stamp_rewrite "$word" "$stamp_manifest_awk"
+    stamp_keep "$word"
+  done
+  if [ -n "$stamp_lock" ]; then
+    stamp_rewrite "$stamp_lock" "$stamp_lockfile_awk" \
+      -v members="$(jq -r '[.[].name] | join(" ")' "$members_doc")"
+    stamp_keep "$stamp_lock"
+  fi
+
+  # A rewrite that missed or overreached fails here or at the --locked
+  # build, rather than shipping a version nobody asked for.
+  in_project cargo metadata --no-deps --format-version 1 --locked \
+    --manifest-path "$manifest_abs" > "$stamp_metadata"
+  if ! jq -e --arg v "$version_input" '.workspace_members as $ids
+      | all(.packages[] | select(.id | IN($ids[])); .version == $v)' \
+    "$stamp_metadata" > /dev/null; then
+    fail "after the version rewrite, a workspace member does not report" \
+      "version $version_input"
+  fi
+  echo "Set version $version_input in ${#stamped_files[@]} file(s):"
+  for word in ${stamped_files[@]+"${stamped_files[@]}"}; do
+    printf '  %q\n' "${word#"$workspace_real"/}"
+  done
+  version_cell="$(md_escape "$version_input") (version input; Cargo.toml holds 0.0.0)"
+fi
 
 ### Run setup script ###
 
@@ -886,6 +1286,9 @@ else
   if [ ! -f "$workspace_root/Cargo.lock" ]; then
     fail "cargo generate-lockfile did not create Cargo.lock"
   fi
+  if [ -n "$version_input" ]; then
+    stamp_keep "$workspace_root/Cargo.lock"
+  fi
   lockfile_cell="⚠️ Generated for this build"
 fi
 
@@ -979,8 +1382,24 @@ if [ "$package_crates" = "true" ]; then
       done < "$crate_list"
     fi
     crates_cell="❌ Failed"
+    # Cargo refuses to package a tree with uncommitted changes, which
+    # the version rewrite makes. --allow-dirty would let any other
+    # change through as well, so it is passed only when every file the
+    # rewrite covered holds exactly its rewritten content and git
+    # reports nothing else under the workspace root. Outside a git
+    # checkout Cargo checks nothing, and gets no flag.
+    dirty_args=()
+    if [ -n "$version_input" ]; then
+      stamp_check_kept
+      if [ -n "$stamp_git_top" ]; then
+        stamp_check_tree after
+        stamp_check_lock
+        dirty_args=(--allow-dirty)
+      fi
+    fi
     package_status=0
-    in_project cargo package --locked --manifest-path "$manifest_abs" \
+    in_project cargo package --locked ${dirty_args[@]+"${dirty_args[@]}"} \
+      --manifest-path "$manifest_abs" \
       "${target_args[@]}" "${package_args[@]}" \
       ${feature_args[@]+"${feature_args[@]}"} || package_status=$?
     if [ "$package_status" -ne 0 ]; then

@@ -87,6 +87,11 @@ inputs:
     description: "Extra 'cargo build' arguments, split on whitespace, never run by a shell"
     required: false
     default: ""
+  version:
+    # yamllint disable-line rule:line-length
+    description: "Release version (SemVer, no leading 'v') to set in place of the 0.0.0 placeholder before building; empty keeps Cargo.toml as it is"
+    required: false
+    default: ""
   binaries:
     # yamllint disable-line rule:line-length
     description: "Copy built binaries into artefact_path with SHA256SUMS ('true'/'false')"
@@ -214,6 +219,7 @@ runs:
         INPUT_TARGET: ${{ inputs.target }}
         INPUT_PROFILE: ${{ inputs.profile }}
         INPUT_CARGO_ARGS: ${{ inputs.cargo_args }}
+        INPUT_VERSION: ${{ inputs.version }}
         INPUT_BINARIES: ${{ inputs.binaries }}
         INPUT_AUDITABLE: ${{ inputs.auditable }}
         INPUT_CARGO_AUDITABLE_VERSION: ${{ inputs.cargo_auditable_version }}

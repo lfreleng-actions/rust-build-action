@@ -40,6 +40,9 @@ repos:
     rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c  # frozen: v6.0.0
     hooks:
       - id: trailing-whitespace
+        # The shared version-stamp vectors must keep their bytes,
+        # CRLF endings and missing final newlines included.
+        exclude: '^tests/fixtures/version-stamp[^/]*/'
       - id: check-added-large-files
       - id: check-ast
       - id: check-json
@@ -48,9 +51,11 @@ repos:
       - id: check-yaml
       - id: debug-statements
       - id: end-of-file-fixer
+        exclude: '^tests/fixtures/version-stamp[^/]*/'
       - id: requirements-txt-fixer
       - id: mixed-line-ending
         args: ["--fix=lf"]
+        exclude: '^tests/fixtures/version-stamp[^/]*/'
       - id: no-commit-to-branch
         args:
           - --branch=dev

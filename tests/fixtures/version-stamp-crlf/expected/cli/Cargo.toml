@@ -1,0 +1,12 @@
+[package]
+name = "demo-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+demo-core = { workspace = true }
+weird = { version = "1.2.3-rc.1+build.5", path = "../tool", package = "demo-tool" }
+
+[dev-dependencies.demo-tool]
+path = "../tool"
+version="^1.2.3-rc.1+build.5"

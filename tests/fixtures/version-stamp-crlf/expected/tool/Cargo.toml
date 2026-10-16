@@ -1,0 +1,6 @@
+[package]
+name    = "demo-tool"
+version =   "1.2.3-rc.1+build.5"
+edition = "2021"
+publish = false
+description = "version = \"0.0.0\" stays inside this string? No: it is not a key"

@@ -29,7 +29,7 @@ setup() {
     cp "$BATS_TEST_DIRNAME/fixtures/$tool.sh" "$workdir/bin/$tool"
     chmod +x "$workdir/bin/$tool"
   done
-  for tool in awk basename bash cat chmod cp cut dirname env grep head jq \
+  for tool in awk basename bash cat chmod cmp cp cut dirname env git grep head jq \
     ln ls mkdir mktemp mv od perl printf readlink rm rmdir sed sha256sum \
     shasum sort tail tee touch tr uname wc xargs; do
     if path="$(command -v "$tool")" && [ -x "$path" ]; then
@@ -1754,6 +1754,605 @@ EOF
     grep -Fq '| Build | ❌ Failed |' "$GITHUB_STEP_SUMMARY"
     [ "$(output_value binaries_json)" = "" ]
   done
+}
+
+### version ###
+
+# The mock workspace, tag-versioned: every member at the placeholder,
+# a dependency requirement on it, and a third-party crate at 0.0.0
+# that must keep its version.
+stamp_fixture() {
+  cat > "$project/Cargo.toml" <<'EOF'
+[package]
+name = "app"
+version = "0.0.0"
+
+[workspace]
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+
+[dependencies]
+lib-a = { path = "crates/lib-a", version = "=0.0.0" }
+zero = "0.0.0"
+EOF
+  printf '[package]\nname = "lib-a"\nversion.workspace = true\n' \
+    > "$project/crates/lib-a/Cargo.toml"
+  printf '[package]\nname = "tool"\nversion = "0.0.0"\npublish = false\n' \
+    > "$project/crates/tool/Cargo.toml"
+  cat > "$project/Cargo.lock" <<'EOF'
+version = 4
+
+[[package]]
+name = "app"
+version = "0.0.0"
+dependencies = [
+ "lib-a 0.0.0",
+ "zero",
+]
+
+[[package]]
+name = "lib-a"
+version = "0.0.0"
+
+[[package]]
+name = "tool"
+version = "0.0.0"
+
+[[package]]
+name = "zero"
+version = "0.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+EOF
+  export MOCK_FILE_VERSIONS=true
+}
+
+# Commit the project as its own repository, ignoring the target
+# directory, with no user or system git configuration.
+commit_project() {
+  export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+  printf '/target/\n/dist/\n' > "$project/.gitignore"
+  git -C "$project" init -q
+  git -C "$project" add -A
+  git -C "$project" -c user.name=test -c user.email=test@example.com \
+    -c commit.gpgsign=false commit -qm fixture
+}
+
+@test "accepts SemVer 2.0 versions, pre-release and build metadata included" {
+  local version
+  for version in 0.0.0 10.20.30 1.0.0-alpha.1 1.0.0-x-y-z.-- \
+    1.0.0+20130313144700 1.2.3-rc.1+build.5 1.2.3-0 1.2.3-0a 1.2.3-rc.1 \
+    1.2.3+001; do
+    stamp_fixture
+    export INPUT_VERSION="$version"
+    run_action
+    [ "$status" -eq 0 ]
+    grep -Fqx "version = \"$version\"" "$project/Cargo.toml"
+  done
+}
+
+@test "rejects malformed versions without echoing them" {
+  stamp_fixture
+  local version
+  # SemVer forbids leading zeros in numeric pre-release identifiers,
+  # but not in build metadata.
+  for version in v1.2.3 1.2 1.2.3.4 01.2.3 1.02.3 1.2.03 1.2.3- 1.2.3+ \
+    1.2.3-01 1.2.3-rc.01 1.2.3-rc.1.00 \
+    1.2.3-a..b 1.2.3+b..c ' 1.2.3' '1.2.3 ' $'1.2.3\n' 1.2.3_1 \
+    '1.2.3-rc.1::error::forged' '1.2.3-"' '1.2.3/'; do
+    : > "$MOCK_CARGO_LOG"
+    : > "$MOCK_RUSTUP_LOG"
+    export INPUT_VERSION="$version"
+    run_action
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"::error title=rust-build::version must be a SemVer 2.0 version without a leading 'v'"* ]]
+    [[ "$output" != *forged* ]]
+    assert_no_cargo
+    grep -Fqx 'version = "0.0.0"' "$project/crates/tool/Cargo.toml"
+  done
+}
+
+@test "refuses a member without the placeholder, naming it, before changing anything" {
+  stamp_fixture
+  printf '[package]\nname = "tool"\nversion = "0.0.1"\n' \
+    > "$project/crates/tool/Cargo.toml"
+  cp -R "$project" "$workdir/before"
+  # The guard covers every member, not only the selected ones.
+  export INPUT_VERSION=1.2.3 INPUT_PACKAGES=lib-a
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"::error title=rust-build::version is set, so every workspace member must carry the placeholder version 0.0.0 in Cargo.toml; tool carries 0.0.1"* ]]
+  local file
+  for file in Cargo.toml Cargo.lock crates/lib-a/Cargo.toml crates/tool/Cargo.toml; do
+    cmp "$workdir/before/$file" "$project/$file"
+  done
+  run ! grep -q '^build ' "$MOCK_CARGO_LOG"
+  grep -q 'Failed at Stamp version' "$GITHUB_STEP_SUMMARY"
+  grep -Fq '| Version | ❌ Failed |' "$GITHUB_STEP_SUMMARY"
+}
+
+# Run the action on a copy of a shared vector set's input/ tree and
+# require every file to equal its expected/ twin byte for byte. The
+# arguments after the set and the version are the workspace members,
+# each as name:dir, with '.' for the root package.
+check_vector_set() {
+  local set="$BATS_TEST_DIRNAME/fixtures/$1" version="$2" member name dir
+  local find_bin
+  # The action's PATH, which the tests run under, holds no find.
+  find_bin="$(PATH=/usr/bin:/bin command -v find)"
+  shift 2
+  rm -rf "${project:?}"/*
+  cp -R "$set/input/." "$project/"
+  {
+    cat <<'JQ'
+def member($root; $name; $dir):
+  { id: "path+file://\($root)/\($dir)#\($name)@0.0.0", name: $name,
+    version: "0.0.0", publish: null, rust_version: null, dependencies: [],
+    manifest_path: "\($root)/\($dir)/Cargo.toml" | sub("/\\./"; "/"),
+    targets: [{ name: ($name | gsub("-"; "_")), kind: ["lib"] }] };
+.workspace_root as $root
+JQ
+    printf '| .packages = ['
+    for member in "$@"; do
+      name="${member%%:*}"
+      dir="${member#*:}"
+      printf 'member($root; "%s"; "%s"),' "$name" "$dir"
+    done
+    echo 'empty]'
+    echo '| .workspace_members = [.packages[].id]'
+    echo '| .workspace_default_members = .workspace_members'
+  } > "$workdir/vector.jq"
+  export INPUT_VERSION="$version" MOCK_FILE_VERSIONS=true \
+    MOCK_METADATA_FILTER_FILE="$workdir/vector.jq"
+  run_action
+
+  [ "$status" -eq 0 ]
+  # Every expected file matches, and nothing else in the tree changed:
+  # the build's output aside, it holds the same files.
+  rm -rf "$project/target"
+  [ "$(cd "$set/expected" && "$find_bin" . -type f | LC_ALL=C sort)" = \
+    "$(cd "$project" && "$find_bin" . -type f | LC_ALL=C sort)" ]
+  local count=0
+  while IFS= read -r -d '' member; do
+    cmp "$set/expected/$member" "$project/$member"
+    count=$((count + 1))
+  done < <(cd "$set/expected" && "$find_bin" . -type f -print0)
+  [ "$count" -ge 3 ]
+}
+
+@test "refuses a member manifest outside the Cargo workspace root" {
+  # git status covers the workspace root alone, so a member outside it
+  # could carry an edit no check sees.
+  stamp_fixture
+  mkdir -p "$workdir/outside"
+  mv "$project/crates/tool/Cargo.toml" "$workdir/outside/Cargo.toml"
+  cp "$workdir/outside/Cargo.toml" "$workdir/before"
+  cat > "$workdir/outside.jq" <<'JQ'
+(.packages[] | select(.name == "tool") | .manifest_path)
+  |= sub("/my project/crates/tool/"; "/outside/")
+JQ
+  export INPUT_VERSION=2.0.0 MOCK_METADATA_FILTER_FILE="$workdir/outside.jq"
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"::error title=rust-build::version is set, but a workspace member's manifest lies outside the Cargo workspace root"* ]]
+  cmp "$workdir/before" "$workdir/outside/Cargo.toml"
+  grep -Fqx 'version = "0.0.0"' "$project/Cargo.lock"
+  run ! grep -q '^build ' "$MOCK_CARGO_LOG"
+}
+
+@test "refuses a member reached through a symlink out of the workspace root" {
+  stamp_fixture
+  mv "$project/crates/tool" "$workdir/tool"
+  ln -s ../../tool "$project/crates/tool"
+  cp "$workdir/tool/Cargo.toml" "$workdir/before"
+  export INPUT_VERSION=2.0.0
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"::error title=rust-build::version is set, but a workspace member's manifest lies outside the Cargo workspace root"* ]]
+  cmp "$workdir/before" "$workdir/tool/Cargo.toml"
+  run ! grep -q '^build ' "$MOCK_CARGO_LOG"
+}
+
+@test "rewrites the shared test vectors byte for byte" {
+  check_vector_set version-stamp 1.2.3-rc.1+build.5 \
+    demo-core:core demo-cli:cli demo-tool:tool
+  # The third-party crate at 0.0.0 keeps its version.
+  [ "$(grep -A1 -x 'name = "zero"' "$project/Cargo.lock" | tail -1)" = 'version = "0.0.0"' ]
+  [[ "$output" == *"Set version 1.2.3-rc.1+build.5 in 4 file(s):"* ]]
+}
+
+@test "rewrites the shared CRLF test vectors byte for byte, endings kept" {
+  # The vectors hold CRLF endings, and two files lack a final newline;
+  # .gitattributes keeps git from converting them.
+  grep -q $'\r$' "$BATS_TEST_DIRNAME/fixtures/version-stamp-crlf/input/Cargo.lock"
+  check_vector_set version-stamp-crlf 1.2.3-rc.1+build.5 \
+    demo-core:core demo-cli:cli demo-tool:tool
+  [[ "$output" == *"Set version 1.2.3-rc.1+build.5 in 4 file(s):"* ]]
+}
+
+@test "rewrites the shared single-line dependencies vectors byte for byte" {
+  check_vector_set version-stamp-inline 2.0.0 demo-a:. demo-b:b
+  grep -Fq '"demo-b-extra 0.0.0"' "$project/Cargo.lock"
+}
+
+@test "rewrites every placeholder on a line, but no namesake outside the workspace" {
+  # A section's first name line names its package, as in the shared
+  # reference implementation.
+  stamp_fixture
+  printf '%s\n' '[package]' 'name = "tool"' 'version = "0.0.0"' '' \
+    '[dependencies]' \
+    'lib-a = { path = "../lib-a", version = "~0.0.0" } # was {version = "0.0.0"}' \
+    > "$project/crates/tool/Cargo.toml"
+  cat >> "$project/Cargo.lock" <<'EOF'
+
+[[package]]
+name = "lib-a"
+version = "0.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = [
+ "lib-a 0.0.0",
+ "zero 0.0.0",
+]
+
+[[package]]
+name = "zero"
+name = "tool"
+version = "0.0.0"
+
+[[patch.unused]]
+name = "tool"
+version = "0.0.0"
+EOF
+  export INPUT_VERSION=2.0.0
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(tail -1 "$project/crates/tool/Cargo.toml")" = 'lib-a = { path = "../lib-a", version = "~2.0.0" } # was {version = "2.0.0"}' ]
+  [ "$(cat "$project/Cargo.lock")" = 'version = 4
+
+[[package]]
+name = "app"
+version = "2.0.0"
+dependencies = [
+ "lib-a 2.0.0",
+ "zero",
+]
+
+[[package]]
+name = "lib-a"
+version = "2.0.0"
+
+[[package]]
+name = "tool"
+version = "2.0.0"
+
+[[package]]
+name = "zero"
+version = "0.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "lib-a"
+version = "0.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = [
+ "lib-a 2.0.0",
+ "zero 0.0.0",
+]
+
+[[package]]
+name = "zero"
+name = "tool"
+version = "0.0.0"
+
+[[patch.unused]]
+name = "tool"
+version = "0.0.0"' ]
+}
+
+@test "keeps a manifest or lockfile without a final newline that way" {
+  stamp_fixture
+  printf '[package]\nname = "tool"\nversion = "0.0.0"' > "$project/crates/tool/Cargo.toml"
+  local lock
+  lock="$(cat "$project/Cargo.lock")"
+  printf '%s' "$lock" > "$project/Cargo.lock"
+  export INPUT_VERSION=2.0.0
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(cat "$project/crates/tool/Cargo.toml"; echo x)" = $'[package]\nname = "tool"\nversion = "2.0.0"x' ]
+  [ "$(tail -c 1 "$project/Cargo.lock")" = '"' ]
+  [ "$(grep -c '^version = "2.0.0"$' "$project/Cargo.lock")" -eq 3 ]
+}
+
+@test "a placeholder the rewrite cannot reach fails before the build" {
+  stamp_fixture
+  printf "[package]\nname = \"tool\"\nversion = '0.0.0'\n" \
+    > "$project/crates/tool/Cargo.toml"
+  export INPUT_VERSION=1.2.3
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"::error title=rust-build::after the version rewrite, a workspace member does not report version 1.2.3"* ]]
+  run ! grep -q '^build ' "$MOCK_CARGO_LOG"
+}
+
+@test "sets the version before setup_script, lockfile generation and the build" {
+  stamp_fixture
+  rm "$project/Cargo.lock"
+  printf '%s\n' 'cp Cargo.toml "$SETUP_RECORD"' > "$project/setup.sh"
+  # The rewrite covers every member, whatever the selection.
+  export INPUT_VERSION=2.0.0 INPUT_SETUP_SCRIPT=setup.sh \
+    SETUP_RECORD="$workdir/setup record" INPUT_PACKAGES=lib-a
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(grep '^saw: ' "$MOCK_CARGO_LOG")" = "$(printf 'saw: %s\n' \
+    'metadata 0.0.0' 'metadata 2.0.0' '--version 2.0.0' 'metadata 2.0.0' \
+    'generate-lockfile 2.0.0' 'build 2.0.0')" ]
+  grep -Fqx 'version = "2.0.0"' "$workdir/setup record"
+  grep -Fqx 'lib-a = { path = "crates/lib-a", version = "=2.0.0" }' "$project/Cargo.toml"
+  grep -Fqx 'zero = "0.0.0"' "$project/Cargo.toml"
+  grep -Fqx 'version = "2.0.0"' "$project/crates/tool/Cargo.toml"
+  grep -Fqx 'version.workspace = true' "$project/crates/lib-a/Cargo.toml"
+  [[ "$output" == *"Set version 2.0.0 in 2 file(s):"* ]]
+}
+
+@test "packages a stamped tree with --allow-dirty once git shows only the rewrite" {
+  stamp_fixture
+  commit_project
+  export INPUT_VERSION=2.0.0 INPUT_PACKAGE_CRATES=true INPUT_WORKSPACE=false
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(package_call)" = "package --locked --allow-dirty --manifest-path @ROOT/Cargo.toml --target=x86_64-unknown-linux-gnu --package=app" ]
+  [ "$(output_value crates_json | jq -r '.[] | "\(.name) \(.version) \(.file)"')" = "app 2.0.0 crates/app-2.0.0.crate" ]
+  grep -Fq '| Version | 2.0.0 (version input; Cargo.toml holds 0.0.0) |' \
+    "$GITHUB_STEP_SUMMARY"
+}
+
+@test "accepts a Cargo.lock this run generated beside the rewrite" {
+  stamp_fixture
+  rm "$project/Cargo.lock"
+  commit_project
+  export INPUT_VERSION=2.0.0 INPUT_PACKAGE_CRATES=true INPUT_WORKSPACE=false
+  run_action
+
+  [ "$status" -eq 0 ]
+  [[ "$(package_call)" == "package --locked --allow-dirty "* ]]
+}
+
+@test "refuses to stamp a checkout that already holds other changes" {
+  stamp_fixture
+  printf 'notes\n' > "$project/crates/lib-a/README.md"
+  commit_project
+  printf 'edited\n' >> "$project/crates/lib-a/README.md"
+  printf 'stray\n' > "$project/crates/lib-a/stray.txt"
+  export INPUT_VERSION=2.0.0 INPUT_PACKAGE_CRATES=true INPUT_WORKSPACE=false
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Uncommitted change besides the version rewrite: crates/lib-a/README.md"* ]]
+  [[ "$output" == *"Uncommitted change besides the version rewrite: crates/lib-a/stray.txt"* ]]
+  [[ "$output" == *"::error title=rust-build::version is set and package_crates is 'true', but 2 path(s) under the workspace root have uncommitted changes before the version rewrite"* ]]
+  grep -Fqx 'version = "0.0.0"' "$project/crates/tool/Cargo.toml"
+  run ! grep -q '^build ' "$MOCK_CARGO_LOG"
+  grep -q 'Failed at Stamp version' "$GITHUB_STEP_SUMMARY"
+}
+
+@test "refuses to stamp a manifest that holds an uncommitted edit of its own" {
+  stamp_fixture
+  commit_project
+  printf 'description = "not committed"\n' >> "$project/crates/tool/Cargo.toml"
+  cp "$project/crates/tool/Cargo.toml" "$workdir/before"
+  export INPUT_VERSION=2.0.0 INPUT_PACKAGE_CRATES=true INPUT_WORKSPACE=false
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Uncommitted change besides the version rewrite: crates/tool/Cargo.toml"* ]]
+  [[ "$output" == *"but 1 path(s) under the workspace root have uncommitted changes before the version rewrite"* ]]
+  cmp "$workdir/before" "$project/crates/tool/Cargo.toml"
+  grep -q 'Failed at Stamp version' "$GITHUB_STEP_SUMMARY"
+}
+
+@test "accepts an untracked Cargo.lock beside the rewrite" {
+  stamp_fixture
+  commit_project
+  git -C "$project" rm -q --cached Cargo.lock
+  git -C "$project" -c user.name=test -c user.email=test@example.com \
+    -c commit.gpgsign=false commit -qm untrack
+  export INPUT_VERSION=2.0.0 INPUT_PACKAGE_CRATES=true INPUT_WORKSPACE=false
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(git -C "$project" status --porcelain -- Cargo.lock)" = "?? Cargo.lock" ]
+  grep -Fqx 'version = "2.0.0"' "$project/Cargo.lock"
+  [[ "$(package_call)" == "package --locked --allow-dirty "* ]]
+}
+
+@test "refuses --allow-dirty when setup_script changes anything besides the rewrite" {
+  stamp_fixture
+  printf '%s\n' 'printf "stray\n" > crates/lib-a/stray.txt' > "$project/setup.sh"
+  commit_project
+  export INPUT_VERSION=2.0.0 INPUT_PACKAGE_CRATES=true INPUT_WORKSPACE=false \
+    INPUT_SETUP_SCRIPT=setup.sh
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Uncommitted change besides the version rewrite: crates/lib-a/stray.txt"* ]]
+  [[ "$output" == *"::error title=rust-build::package_crates needs --allow-dirty to package the version rewrite, but 1 other path(s)"* ]]
+  run ! grep -q '^package ' "$MOCK_CARGO_LOG"
+  grep -q 'Failed at Package crates' "$GITHUB_STEP_SUMMARY"
+  grep -Fq '| Crates | ❌ Uncommitted changes |' "$GITHUB_STEP_SUMMARY"
+}
+
+# setup_script appends a line to FILE, which the rewrite covered: git
+# reports it modified, as the rewrite alone would, but packaging must
+# refuse it.
+check_edit_after_stamp() {
+  local file="$1"
+  stamp_fixture
+  printf 'printf "# edited\\n" >> %s\n' "$file" > "$project/setup.sh"
+  commit_project
+  export INPUT_VERSION=2.0.0 INPUT_PACKAGE_CRATES=true \
+    INPUT_WORKSPACE=false INPUT_SETUP_SCRIPT=setup.sh
+  run_action
+
+  [ "$status" -eq 1 ]
+  # The path is relative to the workspace, quoted for the log.
+  [[ "$output" == *"::error title=rust-build::my\\ project/$file changed after the version rewrite"* ]]
+  [ "$(tail -1 "$project/$file")" = "# edited" ]
+  run ! grep -q '^package ' "$MOCK_CARGO_LOG"
+  grep -q 'Failed at Package crates' "$GITHUB_STEP_SUMMARY"
+  grep -Fq '| Crates | ❌ Changed after the version rewrite |' \
+    "$GITHUB_STEP_SUMMARY"
+}
+
+@test "refuses --allow-dirty when setup_script edits a stamped manifest" {
+  check_edit_after_stamp crates/tool/Cargo.toml
+}
+
+@test "refuses --allow-dirty when setup_script edits the stamped Cargo.lock" {
+  check_edit_after_stamp Cargo.lock
+}
+
+@test "refuses --allow-dirty when a generated Cargo.lock changes after generation" {
+  stamp_fixture
+  rm "$project/Cargo.lock"
+  commit_project
+  # The build runs after the lockfile is generated.
+  export INPUT_VERSION=2.0.0 INPUT_PACKAGE_CRATES=true INPUT_WORKSPACE=false \
+    MOCK_BUILD_APPEND="$project/Cargo.lock"
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"::error title=rust-build::my\\ project/Cargo.lock changed after the version rewrite"* ]]
+  run ! grep -q '^package ' "$MOCK_CARGO_LOG"
+}
+
+@test "refuses --allow-dirty for a Cargo.lock setup_script creates" {
+  # The lockfile is neither stamped nor generated here, so no copy
+  # vouches for it, and the build edits it.
+  stamp_fixture
+  mv "$project/Cargo.lock" "$project/lock.saved"
+  printf '%s\n' 'cp lock.saved Cargo.lock' > "$project/setup.sh"
+  commit_project
+  export INPUT_VERSION=2.0.0 INPUT_PACKAGE_CRATES=true INPUT_WORKSPACE=false \
+    INPUT_SETUP_SCRIPT=setup.sh MOCK_BUILD_APPEND="$project/Cargo.lock"
+  run_action
+
+  [ "$status" -eq 1 ]
+  [ "$(tail -1 "$project/Cargo.lock")" = "# edited" ]
+  [[ "$output" == *"Uncommitted change besides the version rewrite: Cargo.lock"* ]]
+  [[ "$output" == *"::error title=rust-build::package_crates needs --allow-dirty to package the version rewrite, but 1 other path(s)"* ]]
+  run ! grep -q '^package ' "$MOCK_CARGO_LOG"
+}
+
+@test "refuses --allow-dirty when setup_script changes a stamped file's mode" {
+  # Cargo records the executable bit in the .crate.
+  stamp_fixture
+  printf '%s\n' 'chmod +x crates/tool/Cargo.toml' > "$project/setup.sh"
+  commit_project
+  export INPUT_VERSION=2.0.0 INPUT_PACKAGE_CRATES=true INPUT_WORKSPACE=false \
+    INPUT_SETUP_SCRIPT=setup.sh
+  run_action
+
+  [ "$status" -eq 1 ]
+  [ -x "$project/crates/tool/Cargo.toml" ]
+  [[ "$output" == *"::error title=rust-build::my\\ project/crates/tool/Cargo.toml changed after the version rewrite"* ]]
+  run ! grep -q '^package ' "$MOCK_CARGO_LOG"
+}
+
+@test "refuses --allow-dirty when setup_script swaps a stamped file for a symlink" {
+  # An untracked Cargo.lock reads '??' either way, and the link's
+  # target holds the stamped content, which cmp would follow.
+  stamp_fixture
+  printf '%s\n' 'cp Cargo.lock ../lock.copy' 'rm Cargo.lock' \
+    'ln -s ../lock.copy Cargo.lock' > "$project/setup.sh"
+  commit_project
+  git -C "$project" rm -q --cached Cargo.lock
+  git -C "$project" -c user.name=test -c user.email=test@example.com \
+    -c commit.gpgsign=false commit -qm untrack
+  export INPUT_VERSION=2.0.0 INPUT_PACKAGE_CRATES=true INPUT_WORKSPACE=false \
+    INPUT_SETUP_SCRIPT=setup.sh
+  run_action
+
+  [ "$status" -eq 1 ]
+  [ -L "$project/Cargo.lock" ]
+  [ "$(git -C "$project" status --porcelain -- Cargo.lock)" = "?? Cargo.lock" ]
+  [[ "$output" == *"::error title=rust-build::my\\ project/Cargo.lock changed after the version rewrite"* ]]
+  run ! grep -q '^package ' "$MOCK_CARGO_LOG"
+}
+
+@test "refuses --allow-dirty for an ignored Cargo.lock setup_script creates" {
+  # git status shows no ignored file, so only the copies can vouch for
+  # the lockfile Cargo packages.
+  stamp_fixture
+  mv "$project/Cargo.lock" "$project/lock.saved"
+  printf '%s\n' 'cp lock.saved Cargo.lock' > "$project/setup.sh"
+  commit_project
+  printf '/Cargo.lock\n' >> "$project/.git/info/exclude"
+  export INPUT_VERSION=2.0.0 INPUT_PACKAGE_CRATES=true INPUT_WORKSPACE=false \
+    INPUT_SETUP_SCRIPT=setup.sh MOCK_BUILD_APPEND="$project/Cargo.lock"
+  run_action
+
+  [ "$status" -eq 1 ]
+  [ -z "$(git -C "$project" status --porcelain --untracked-files=all -- Cargo.lock)" ]
+  [[ "$output" == *"::error title=rust-build::Cargo.lock appeared after the version rewrite"* ]]
+  run ! grep -q '^package ' "$MOCK_CARGO_LOG"
+}
+
+@test "a member path holding newlines cannot stand in for another path" {
+  # The member's manifest path, relative to the repository, holds the
+  # line 'src/lib.rs': matching it line by line would accept an edit
+  # to the root's src/lib.rs.
+  stamp_fixture
+  local odd=$'crates/odd\nsrc/lib.rs\ntool'
+  mkdir -p "$project/${odd%/*}"
+  mv "$project/crates/tool" "$project/$odd"
+  mkdir "$project/src"
+  printf 'pub fn value() {}\n' > "$project/src/lib.rs"
+  printf '%s\n' 'printf "// edited\n" >> src/lib.rs' > "$project/setup.sh"
+  cat > "$workdir/odd.jq" <<'JQ'
+(.packages[] | select(.name == "tool") | .manifest_path)
+  |= sub("/crates/tool/"; "/crates/odd\nsrc/lib.rs\ntool/")
+JQ
+  commit_project
+  export INPUT_VERSION=2.0.0 INPUT_PACKAGE_CRATES=true INPUT_WORKSPACE=false \
+    INPUT_SETUP_SCRIPT=setup.sh MOCK_METADATA_FILTER_FILE="$workdir/odd.jq"
+  run_action
+
+  [ "$status" -eq 1 ]
+  grep -Fqx 'version = "2.0.0"' "$project/$odd/Cargo.toml"
+  [[ "$output" == *"Uncommitted change besides the version rewrite: src/lib.rs"* ]]
+  [[ "$output" == *"::error title=rust-build::package_crates needs --allow-dirty to package the version rewrite, but 1 other path(s)"* ]]
+  run ! grep -q '^package ' "$MOCK_CARGO_LOG"
+}
+
+@test "packages a stamped tree outside git without --allow-dirty" {
+  stamp_fixture
+  export INPUT_VERSION=2.0.0 INPUT_PACKAGE_CRATES=true INPUT_WORKSPACE=false
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(package_call)" = "package --locked --manifest-path @ROOT/Cargo.toml --target=x86_64-unknown-linux-gnu --package=app" ]
+  [[ "$output" == *"Not in a git checkout: packaging without --allow-dirty"* ]]
+}
+
+@test "an empty version leaves the manifests, the summary and packaging alone" {
+  stamp_fixture
+  commit_project
+  export INPUT_PACKAGE_CRATES=true INPUT_WORKSPACE=false
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ -z "$(git -C "$project" status --porcelain)" ]
+  [ "$(package_call)" = "package --locked --manifest-path @ROOT/Cargo.toml --target=x86_64-unknown-linux-gnu --package=app" ]
+  run ! grep -q '| Version |' "$GITHUB_STEP_SUMMARY"
 }
 
 ### action.yaml wiring ###
