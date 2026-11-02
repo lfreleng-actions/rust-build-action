@@ -32,8 +32,8 @@ jobs:
       packages: read  # fetch internal or private CodeQL packs
       actions: read  # the upload reads run info on private repositories
     # yamllint disable-line rule:line-length
-    uses: lfreleng-actions/security-workflows/.github/workflows/codeql.yaml@ef6c0d9930feedb274067703b50eeebe5ab859b3  # v0.9.5
+    uses: lfreleng-actions/security-workflows/.github/workflows/codeql.yaml@378fcc19ebdf37f17fde4888d4b71c83b21d6cf3  # v0.9.7
     with:
       languages: 'actions,javascript-typescript'
       # yamllint disable-line rule:line-length
-      harden_runner_allowlist: 'lfreleng-actions//.github/harden-runner/lfreleng-actions/allow_list.txt@538904e241556d101fb908b50e2a2965fa0346cf'  # v0.16.6
+      harden_runner_allowlist: 'lfreleng-actions//.github/harden-runner/lfreleng-actions/allow_list.txt@6d4a65c5601afd6c2fbe52bda4b0024b132f265d'  # v0.19.0
