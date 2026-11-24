@@ -7,7 +7,7 @@
 
 <!-- prettier-ignore-start -->
 <!-- markdownlint-disable-next-line MD013 -->
-[![Linux Foundation](https://img.shields.io/badge/Linux-Foundation-blue)](https://linuxfoundation.org/) [![Source Code](https://img.shields.io/badge/GitHub-100000?logo=github&logoColor=white&color=blue)](https://github.com/lfreleng-actions/rust-build-action) [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0) [![pre-commit.ci status badge]][pre-commit.ci results page] [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/lfreleng-actions/rust-build-action/badge)](https://scorecard.dev/viewer/?uri=github.com/lfreleng-actions/rust-build-action)
+[![Linux Foundation](https://img.shields.io/badge/Linux-Foundation-blue)](https://linuxfoundation.org/) [![Source Code](https://img.shields.io/badge/GitHub-100000?logo=github&logoColor=white&color=blue)](https://github.com/lfreleng-actions/rust-build-action) [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0) [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/lfreleng-actions/rust-build-action/badge)](https://scorecard.dev/viewer/?uri=github.com/lfreleng-actions/rust-build-action)
 <!-- prettier-ignore-end -->
 
 Builds a Rust project with Cargo. On request, it also collects the
@@ -426,6 +426,3 @@ or `Cargo.lock`.
   [Tag-based versioning](#tag-based-versioning).
 - With `binaries` and `package_crates` both `false`, `artefact_path`
   stays empty and the action uploads nothing.
-
-[pre-commit.ci results page]: https://results.pre-commit.ci/latest/github/lfreleng-actions/rust-build-action/main
-[pre-commit.ci status badge]: https://results.pre-commit.ci/badge/github/lfreleng-actions/rust-build-action/main.svg
